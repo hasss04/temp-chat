@@ -1,4 +1,4 @@
-# TempChat Secure — Netlify Production Build
+<!-- # TempChat Secure — Netlify Production Build
 
 This is a production-oriented React + TypeScript + Vite PWA for Netlify with:
 - installable PWA setup using `vite-plugin-pwa`
@@ -36,4 +36,4 @@ npm run dev
 - Add TURN credentials.
 - Replace manual SDP/ICE exchange with persistent signaling.
 - Add auth and room expiry.
-- Add abuse limits and rate limiting.
+- Add abuse limits and rate limiting. -->
