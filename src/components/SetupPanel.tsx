@@ -1,117 +1,218 @@
-import { FormEvent, useState } from 'react';
-import { ArrowRight, Dices, Lock } from 'lucide-react';
-import { restoreMessages } from '../lib/storage';
+import { useState } from 'react';
+import { MessageCircle, ArrowRight, Shuffle } from 'lucide-react';
 import { generateRoomId } from '../lib/roomId';
+import { createRoom } from '../lib/signaling';
+import { persistSession, restoreMessages } from '../lib/storage';
 import { useAppStore } from '../store/useAppStore';
+import { ThemeToggle } from './ThemeToggle';
 
 export function SetupPanel() {
   const setStatePartial = useAppStore((s) => s.setStatePartial);
-  const [roomId, setRoomId] = useState('');
+  const pushToast = useAppStore((s) => s.pushToast);
+  const themeMode = useAppStore((s) => s.themeMode);
+
   const [nickname, setNickname] = useState('');
+  const [roomIdInput, setRoomIdInput] = useState('');
   const [secret, setSecret] = useState('');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
 
-  async function submit(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault();
-    setError('');
-    setLoading(true);
-    try {
-      const messages = await restoreMessages(roomId.trim(), secret.trim()).catch(() => []);
-      setStatePartial({
-        roomId: roomId.trim(),
-        nickname: nickname.trim() || 'Anon',
-        secret: secret.trim(),
-        messages
+  async function enterRoom(roomId: string, roomType: 'private' | 'group' = 'private') {
+    const trimmedRoom = roomId.trim().toLowerCase();
+    const trimmedSecret = secret.trim();
+    const trimmedName = nickname.trim() || 'Anon';
+
+    if (!trimmedRoom) {
+      pushToast({
+        tone: 'error',
+        title: 'Room ID required',
+        message: 'Enter or generate a room ID first.',
       });
-    } catch {
-      setError('Could not open that room. Check the room ID and secret.');
+      return;
+    }
+
+    if (!trimmedSecret) {
+      pushToast({
+        tone: 'error',
+        title: 'Passphrase required',
+        message: 'Enter a shared passphrase to encrypt this room.',
+      });
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      const messages = await restoreMessages(trimmedRoom, trimmedSecret).catch(() => []);
+
+      setStatePartial({
+        roomId: trimmedRoom,
+        nickname: trimmedName,
+        secret: trimmedSecret,
+        connectionStatus: 'joining',
+        activeTab: 'chat',
+        messages,
+        roomFull: false,
+        draft: '',
+        groupInfo:
+          roomType === 'group'
+            ? {
+                roomId: trimmedRoom,
+                isGroup: true,
+                participants: [],
+                maxParticipants: 12,
+              }
+            : null,
+      });
+
+      await persistSession({
+        roomId: trimmedRoom,
+        nickname: trimmedName,
+        secret: trimmedSecret,
+        activeTab: 'chat',
+        theme: themeMode,
+        draft: '',
+        lastSeenAt: Date.now(),
+      });
+    } catch (error) {
+      pushToast({
+        tone: 'error',
+        title: 'Could not enter room',
+        message: error instanceof Error ? error.message : 'Unknown error',
+      });
     } finally {
       setLoading(false);
     }
   }
 
-  return (
-    <section className="setup-shell">
-      <div className="setup-mark">
-        <span className="setup-mark-dot" />
-        <span className="setup-mark-dot" />
-      </div>
-      <h1 className="setup-title">TempChat</h1>
-      <p className="setup-sub">
-        Peer-to-peer chat and calls. Nothing touches a server — your history is
-        encrypted with a secret only you and the other person know.
-      </p>
+  function handleRandomize() {
+    setRoomIdInput(generateRoomId());
+  }
 
-      <form className="setup-form" onSubmit={submit}>
-        <div className="field-group">
-          <label htmlFor="roomId">Room ID</label>
-          <div className="room-id-row">
-            <input
-              id="roomId"
-              name="roomId"
-              type="text"
-              inputMode="text"
-              autoCapitalize="none"
-              autoCorrect="off"
-              autoComplete="off"
-              className="mono-input"
-              placeholder="quiet-harbor-42"
-              value={roomId}
-              onChange={(e) => setRoomId(e.target.value)}
-              required
-            />
-            <button
-              type="button"
-              className="dice-btn"
-              title="Generate a room ID"
-              onClick={() => setRoomId(generateRoomId())}
-            >
-              <Dices size={18} />
-            </button>
+  async function handleCreateAndJoin() {
+    const roomId = generateRoomId();
+    const trimmedSecret = secret.trim();
+    const trimmedName = nickname.trim() || 'Anon';
+
+    if (!trimmedSecret) {
+      pushToast({
+        tone: 'error',
+        title: 'Passphrase required',
+        message: 'Enter a shared passphrase before creating a new room.',
+      });
+      return;
+    }
+
+    setRoomIdInput(roomId);
+    setLoading(true);
+
+    try {
+      await createRoom(roomId, crypto.randomUUID(), {
+        type: 'group',
+        nickname: trimmedName,
+        maxPeers: 12,
+      });
+
+      await enterRoom(roomId, 'group');
+    } catch (error) {
+      setLoading(false);
+      pushToast({
+        tone: 'error',
+        title: 'Could not create room',
+        message: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  function handleJoin(e: React.FormEvent) {
+    e.preventDefault();
+    void enterRoom(roomIdInput, 'private');
+  }
+
+  return (
+    <div className="setup-shell">
+      <div className="setup-topbar">
+        <ThemeToggle />
+      </div>
+
+      <div className="setup-card">
+        <div className="setup-brand">
+          <div className="setup-brand-icon">
+            <MessageCircle size={22} />
           </div>
+          <h1>TempChat</h1>
+          <p>End-to-end encrypted peer-to-peer messaging. Nothing is stored on a server.</p>
         </div>
 
-        <div className="field-row">
-          <div className="field-group">
-            <label htmlFor="nickname">Name</label>
+        <form className="setup-form" onSubmit={handleJoin}>
+          <label className="setup-field">
+            <span>Display name</span>
             <input
-              id="nickname"
-              name="nickname"
-              type="text"
-              autoComplete="nickname"
-              placeholder="Anon"
               value={nickname}
               onChange={(e) => setNickname(e.target.value)}
+              placeholder="Anonymous"
+              maxLength={24}
+              autoComplete="off"
+              aria-label="Display name"
+              disabled={loading}
             />
-          </div>
-          <div className="field-group">
-            <label htmlFor="secret">Shared secret</label>
+          </label>
+
+          <label className="setup-field">
+            <span>Room ID</span>
+            <div className="setup-room-row">
+              <input
+                value={roomIdInput}
+                onChange={(e) => setRoomIdInput(e.target.value)}
+                placeholder="zelith-korven-482"
+                autoComplete="off"
+                aria-label="Room ID"
+                disabled={loading}
+              />
+              <button
+                type="button"
+                className="setup-randomize-btn"
+                onClick={handleRandomize}
+                aria-label="Randomize room ID"
+                title="Randomize room ID"
+                disabled={loading}
+              >
+                <Shuffle size={15} />
+              </button>
+            </div>
+          </label>
+
+          <label className="setup-field">
+            <span>Passphrase</span>
             <input
-              id="secret"
-              name="secret"
-              type="password"
-              autoComplete="new-password"
-              placeholder="Only you two know this"
               value={secret}
               onChange={(e) => setSecret(e.target.value)}
-              required
+              placeholder="Shared encryption passphrase"
+              type="password"
+              autoComplete="off"
+              aria-label="Encryption passphrase"
+              disabled={loading}
             />
-          </div>
+          </label>
+
+          <button type="submit" className="setup-primary-btn" disabled={loading}>
+            {loading ? 'Joining…' : 'Join room'}
+            <ArrowRight size={16} />
+          </button>
+        </form>
+
+        <div className="setup-divider">
+          <span>or</span>
         </div>
 
-        {error && <p className="setup-error">{error}</p>}
-
-        <button className="setup-submit" type="submit" disabled={loading}>
-          <span>{loading ? 'Opening…' : 'Enter room'}</span>
-          <ArrowRight size={17} />
+        <button
+          type="button"
+          className="setup-secondary-btn"
+          onClick={() => void handleCreateAndJoin()}
+          disabled={loading}
+        >
+          {loading ? 'Creating…' : 'Create a new room'}
         </button>
-
-        <p className="setup-footnote">
-          <Lock size={13} />
-          Same room ID and secret on both devices — that's the whole handshake.
-        </p>
-      </form>
-    </section>
+      </div>
+    </div>
   );
 }

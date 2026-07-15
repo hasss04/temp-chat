@@ -2,43 +2,54 @@ import { useEffect, useRef } from 'react';
 
 export function useVisibilityReconnect(
   getConnectionState: () => RTCPeerConnectionState | 'unknown',
-  onReconnectNeeded: () => void
+  onReconnectNeeded: () => void,
 ) {
   const wasHiddenRef = useRef(false);
+  const reconnectCooldownRef = useRef(0);
+
   const getStateRef = useRef(getConnectionState);
   const onReconnectRef = useRef(onReconnectNeeded);
 
-  // keep refs current without re-triggering the effect below
   getStateRef.current = getConnectionState;
   onReconnectRef.current = onReconnectNeeded;
 
   useEffect(() => {
-    function checkAndMaybeReconnect() {
+    function maybeReconnect() {
+      const now = Date.now();
+      if (now - reconnectCooldownRef.current < 2500) return;
+
       const state = getStateRef.current();
-      const dead = state === 'failed' || state === 'disconnected' || state === 'closed';
-      if (dead) onReconnectRef.current();
+      const shouldReconnect =
+        state === 'failed' || state === 'closed' || state === 'disconnected';
+
+      if (!shouldReconnect) return;
+
+      reconnectCooldownRef.current = now;
+      onReconnectRef.current();
     }
 
-    function onVisibility() {
-      if (document.visibilityState === 'visible' && wasHiddenRef.current) {
-        wasHiddenRef.current = false;
-        checkAndMaybeReconnect();
-      }
+    function onVisibilityChange() {
       if (document.visibilityState === 'hidden') {
         wasHiddenRef.current = true;
+        return;
+      }
+
+      if (document.visibilityState === 'visible' && wasHiddenRef.current) {
+        wasHiddenRef.current = false;
+        maybeReconnect();
       }
     }
 
     function onOnline() {
-      checkAndMaybeReconnect();
+      maybeReconnect();
     }
 
-    document.addEventListener('visibilitychange', onVisibility);
+    document.addEventListener('visibilitychange', onVisibilityChange);
     window.addEventListener('online', onOnline);
 
     return () => {
-      document.removeEventListener('visibilitychange', onVisibility);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('online', onOnline);
     };
-  }, []); // stable — runs exactly once per mount, never re-triggers
+  }, []);
 }
