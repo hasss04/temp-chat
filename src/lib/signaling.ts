@@ -1,4 +1,7 @@
-const API_BASE = '/.netlify/functions';
+// Falls back to relative path (correct when served from the same Netlify origin,
+// e.g. `netlify dev` or your deployed site). Override with VITE_API_BASE if
+// your frontend and functions are served from different origins/ports.
+const API_BASE = import.meta.env.VITE_API_BASE || '/.netlify/functions';
 
 export type RoomPayload = {
   peers: string[];
@@ -14,7 +17,7 @@ async function call(roomId: string, method: string, peerId?: string, body?: unkn
   const res = await fetch(`${API_BASE}/presence?${qs.toString()}`, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
-    body: body ? JSON.stringify(body) : undefined
+    body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok) throw new Error(`presence ${method} failed`);
   return res.json() as Promise<RoomPayload>;
@@ -30,7 +33,6 @@ export const postAnswer = (roomId: string, peerId: string, answer: RTCSessionDes
 export const postIce = (roomId: string, peerId: string, candidate: RTCIceCandidateInit) =>
   call(roomId, 'POST', peerId, { ice: [JSON.stringify(candidate)] });
 
-// Deterministic role assignment — avoids both peers becoming "offerer"
 export async function determineRole(roomId: string, peerId: string): Promise<'offerer' | 'answerer'> {
   for (let i = 0; i < 20; i++) {
     try {
