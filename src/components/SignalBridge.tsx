@@ -1,5 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { MessageCircle, Phone, Trash2, Video } from 'lucide-react';
+import {
+  Mic,
+  MicOff,
+  MessageCircle,
+  Phone,
+  PhoneOff,
+  Send,
+  Trash2,
+  Video,
+  VideoOff,
+} from 'lucide-react';
 import {
   determineRole,
   getRoom,
@@ -15,42 +25,60 @@ import { useWebRTC } from '../hooks/useWebRTC';
 import { useVisibilityReconnect } from '../hooks/useVisibilityReconnect';
 
 type Role = 'offerer' | 'answerer';
+type Status = 'joining' | 'waiting' | 'connecting' | 'connected' | 'reconnecting' | 'error';
+
+function formatTime(ts: number) {
+  return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function initialsOf(name: string) {
+  return (name || 'A').trim().slice(0, 2).toUpperCase();
+}
 
 export function SignalBridge() {
-  const {
-    roomId,
-    secret,
-    nickname,
-    messages,
-    addMessage,
-    reset,
-    setStatePartial,
-    connected,
-  } = useAppStore();
+  const { roomId, secret, nickname, messages, addMessage, reset, setStatePartial, connected } =
+    useAppStore();
 
   const [draft, setDraft] = useState('');
   const [tab, setTab] = useState<'chat' | 'call'>('chat');
   const [role, setRole] = useState<Role | null>(null);
-  const [status, setStatus] = useState<
-    'joining' | 'waiting' | 'connecting' | 'connected' | 'reconnecting' | 'error'
-  >('joining');
+  const [status, setStatus] = useState<Status>('joining');
   const [restartKey, setRestartKey] = useState(0);
+  const [peerTyping, setPeerTyping] = useState(false);
+  const [inCall, setInCall] = useState(false);
+  const [micOn, setMicOn] = useState(true);
+  const [camOn, setCamOn] = useState(true);
+  const [callConnecting, setCallConnecting] = useState(false);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
   const peerId = useMemo(() => crypto.randomUUID(), []);
   const appliedIce = useRef<Record<string, number>>({});
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const answerAppliedRef = useRef(false);
+  const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const localTypingSentRef = useRef(false);
+  const peerTypingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const rtc = useWebRTC(
-    (text) =>
-      addMessage({
-        id: crypto.randomUUID(),
-        sender: 'peer',
-        text,
-        createdAt: Date.now(),
-      }),
+    {
+      onChat: (wire) =>
+        addMessage({
+          id: wire.id,
+          sender: 'peer',
+          text: wire.text,
+          createdAt: wire.createdAt,
+        }),
+      onTyping: (isTyping) => {
+        setPeerTyping(isTyping);
+        if (peerTypingTimeoutRef.current) clearTimeout(peerTypingTimeoutRef.current);
+        if (isTyping) {
+          peerTypingTimeoutRef.current = setTimeout(() => setPeerTyping(false), 4000);
+        }
+      },
+    },
     restartKey,
   );
 
@@ -69,23 +97,23 @@ export function SignalBridge() {
   }, [messages, roomId, secret]);
 
   useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [messages, peerTyping]);
+
+  useEffect(() => {
     let myRole: Role | null = null;
     let cancelled = false;
 
     const onLocal = (e: Event) => {
       const stream = (e as CustomEvent<MediaStream | null>).detail;
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream ?? null;
-      }
+      if (localVideoRef.current) localVideoRef.current.srcObject = stream ?? null;
+      setInCall(!!stream);
+      setCallConnecting(false);
     };
-
     const onRemote = (e: Event) => {
       const stream = (e as CustomEvent<MediaStream | null>).detail;
-      if (remoteVideoRef.current) {
-        remoteVideoRef.current.srcObject = stream ?? null;
-      }
+      if (remoteVideoRef.current) remoteVideoRef.current.srcObject = stream ?? null;
     };
-
     window.addEventListener('tempchat:local-stream', onLocal as EventListener);
     window.addEventListener('tempchat:remote-stream', onRemote as EventListener);
 
@@ -98,10 +126,8 @@ export function SignalBridge() {
         if (restartKey > 0) {
           await leaveRoom(roomId, peerId).catch(() => {});
         }
-
         await joinRoom(roomId, peerId).catch(() => {});
         myRole = await determineRole(roomId, peerId);
-
         if (cancelled) return;
         setRole(myRole);
 
@@ -120,22 +146,27 @@ export function SignalBridge() {
         }
 
         pollRef.current = setInterval(async () => {
+          // Once truly connected, signaling is no longer needed — stop polling
+          // so a stray network hiccup can never flip the status back to "error".
+          if (rtc.getConnectionState() === 'connected') {
+            if (pollRef.current) {
+              clearInterval(pollRef.current);
+              pollRef.current = null;
+            }
+            return;
+          }
           try {
             const room = await getRoom(roomId);
-
             if (myRole === 'answerer' && !answerAppliedRef.current && room.offer) {
               const answer = await rtc.acceptRemoteOffer(JSON.parse(room.offer));
               await postAnswer(roomId, peerId, answer);
               answerAppliedRef.current = true;
             }
-
             if (myRole === 'offerer' && room.answer && !connected) {
               await rtc.acceptRemoteAnswer(JSON.parse(room.answer));
             }
-
             for (const [otherId, candidates] of Object.entries(room.ice ?? {})) {
               if (otherId === peerId) continue;
-
               const applied = appliedIce.current[otherId] ?? 0;
               for (let i = applied; i < candidates.length; i++) {
                 await rtc.addIceCandidate(JSON.parse(candidates[i]));
@@ -143,7 +174,9 @@ export function SignalBridge() {
               appliedIce.current[otherId] = candidates.length;
             }
           } catch {
-            if (!cancelled) setStatus('error');
+            if (!cancelled && rtc.getConnectionState() !== 'connected') {
+              setStatus('error');
+            }
           }
         }, 1500);
       } catch {
@@ -154,40 +187,76 @@ export function SignalBridge() {
     return () => {
       cancelled = true;
       offIce();
-
       if (pollRef.current) {
         clearInterval(pollRef.current);
         pollRef.current = null;
       }
-
       window.removeEventListener('tempchat:local-stream', onLocal as EventListener);
       window.removeEventListener('tempchat:remote-stream', onRemote as EventListener);
-
       leaveRoom(roomId, peerId).catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [peerId, roomId, restartKey]);
 
   useEffect(() => {
-    if (connected) {
-      setStatus('connected');
-    }
+    if (connected) setStatus('connected');
   }, [connected]);
 
+  function handleDraftChange(value: string) {
+    setDraft(value);
+    if (!localTypingSentRef.current) {
+      localTypingSentRef.current = true;
+      rtc.send({ kind: 'typing', isTyping: true });
+    }
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    typingTimeoutRef.current = setTimeout(() => {
+      localTypingSentRef.current = false;
+      rtc.send({ kind: 'typing', isTyping: false });
+    }, 1800);
+  }
+
   function sendMessage() {
-    if (!draft.trim()) return;
+    const text = draft.trim();
+    if (!text) return;
+    const id = crypto.randomUUID();
+    const createdAt = Date.now();
 
-    const text = `${nickname || 'Anon'}: ${draft.trim()}`;
-    const message = {
-      id: crypto.randomUUID(),
-      sender: 'me' as const,
-      text,
-      createdAt: Date.now(),
-    };
+    addMessage({ id, sender: 'me', text, createdAt });
+    rtc.send({ kind: 'chat', id, text, senderName: nickname || 'Anon', createdAt });
 
-    addMessage(message);
-    rtc.sendText(message.text);
+    if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+    localTypingSentRef.current = false;
+    rtc.send({ kind: 'typing', isTyping: false });
+
     setDraft('');
+  }
+
+  async function toggleCall() {
+    if (inCall) {
+      rtc.endCall();
+      setInCall(false);
+      return;
+    }
+    try {
+      setCallConnecting(true);
+      await rtc.startCall();
+      setMicOn(true);
+      setCamOn(true);
+    } catch {
+      setCallConnecting(false);
+    }
+  }
+
+  function toggleMic() {
+    const next = !micOn;
+    setMicOn(next);
+    rtc.toggleAudio(next);
+  }
+
+  function toggleCam() {
+    const next = !camOn;
+    setCamOn(next);
+    rtc.toggleVideo(next);
   }
 
   async function killSwitch() {
@@ -197,7 +266,7 @@ export function SignalBridge() {
     reset();
   }
 
-  const statusLabel: Record<string, string> = {
+  const statusLabel: Record<Status, string> = {
     joining: 'Joining room…',
     waiting: 'Waiting for the other device…',
     connecting: 'Connecting…',
@@ -215,7 +284,6 @@ export function SignalBridge() {
             <span className={`link-line ${status === 'connected' ? 'live' : ''}`} />
             <span className={`link-dot ${connected ? 'set' : ''}`} />
           </div>
-
           <div>
             <p className="room-id-label">{roomId}</p>
             <p
@@ -224,14 +292,15 @@ export function SignalBridge() {
                   ? 'room-status-connected'
                   : status === 'reconnecting'
                     ? 'room-status-reconnecting'
-                    : ''
+                    : status === 'error'
+                      ? 'room-status-error'
+                      : ''
               }`}
             >
-              {statusLabel[status] ?? status}
+              {statusLabel[status]}
             </p>
           </div>
         </div>
-
         <button
           type="button"
           className="kill-btn"
@@ -244,82 +313,142 @@ export function SignalBridge() {
       </header>
 
       <nav className="tab-bar" aria-label="Room sections">
-        <button
-          type="button"
-          className={tab === 'chat' ? 'active' : ''}
-          onClick={() => setTab('chat')}
-        >
+        <button type="button" className={tab === 'chat' ? 'active' : ''} onClick={() => setTab('chat')}>
           <MessageCircle size={15} />
           Chat
         </button>
-
-        <button
-          type="button"
-          className={tab === 'call' ? 'active' : ''}
-          onClick={() => setTab('call')}
-        >
+        <button type="button" className={tab === 'call' ? 'active' : ''} onClick={() => setTab('call')}>
           <Video size={15} />
           Call
+          {inCall && <span className="live-chip">live</span>}
         </button>
       </nav>
 
       <div className="room-body">
         <main className={`chat-panel ${tab === 'chat' ? '' : 'hide-on-mobile'}`}>
           <div className="messages">
-            {messages.map((message) => (
-              <div key={message.id} className={`bubble ${message.sender}`}>
-                {message.text}
-              </div>
-            ))}
-
-            {messages.length === 0 && (
+            {messages.length === 0 && !peerTyping && (
               <div className="empty-state">
                 No messages yet. Once your peer connects, everything you send stays only on these two
                 devices.
               </div>
             )}
+
+            {messages.map((message, i) => {
+              const prev = messages[i - 1];
+              const showMeta = !prev || prev.sender !== message.sender;
+              const isMe = message.sender === 'me';
+              return (
+                <div key={message.id} className={`msg-row ${isMe ? 'me' : 'peer'}`}>
+                  {!isMe && (
+                    <span className={`msg-avatar ${showMeta ? '' : 'ghost'}`}>
+                      {showMeta ? initialsOf('Peer') : ''}
+                    </span>
+                  )}
+                  <div className="msg-col">
+                    <div className={`bubble ${message.sender}`}>{message.text}</div>
+                    <span className="msg-time">{formatTime(message.createdAt)}</span>
+                  </div>
+                </div>
+              );
+            })}
+
+            {peerTyping && (
+              <div className="msg-row peer">
+                <span className="msg-avatar">{initialsOf('Peer')}</span>
+                <div className="typing-bubble" aria-label="Peer is typing">
+                  <span />
+                  <span />
+                  <span />
+                </div>
+              </div>
+            )}
+
+            <div ref={messagesEndRef} />
           </div>
 
           <div className="composer">
             <input
               value={draft}
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => handleDraftChange(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') sendMessage();
               }}
               placeholder="Message"
             />
-            <button type="button" onClick={sendMessage}>
-              Send
+            <button type="button" onClick={sendMessage} disabled={!draft.trim()} aria-label="Send">
+              <Send size={17} />
             </button>
           </div>
         </main>
 
         <section className={`call-panel ${tab === 'call' ? '' : 'hide-on-mobile'}`}>
-          <button type="button" className="call-start" onClick={() => rtc.startCall()}>
-            <Phone size={16} />
-            Start camera & mic
-          </button>
-
-          <div className="video-wrap">
-            <div className="video-tile">
+          <div className={`call-stage ${inCall ? 'active' : ''}`}>
+            <video ref={remoteVideoRef} className="remote-video" autoPlay playsInline />
+            {!connected && (
+              <div className="call-placeholder">
+                <Video size={22} />
+                <span>Waiting for your peer to connect…</span>
+              </div>
+            )}
+            {connected && !inCall && (
+              <div className="call-placeholder">
+                <Video size={22} />
+                <span>Start your camera to begin a call</span>
+              </div>
+            )}
+            <div className={`local-video-pip ${inCall ? '' : 'hidden'}`}>
               <video ref={localVideoRef} autoPlay muted playsInline />
-              <span className="video-label">You</span>
             </div>
+          </div>
 
-            <div className="video-tile">
-              <video ref={remoteVideoRef} autoPlay playsInline />
-              <span className="video-label">Peer</span>
-            </div>
+          <div className="call-controls">
+            {!inCall ? (
+              <button
+                type="button"
+                className="call-btn primary"
+                onClick={toggleCall}
+                disabled={!connected || callConnecting}
+              >
+                <Phone size={16} />
+                {callConnecting ? 'Connecting…' : 'Start call'}
+              </button>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  className={`call-icon-btn ${micOn ? '' : 'off'}`}
+                  onClick={toggleMic}
+                  aria-label={micOn ? 'Mute microphone' : 'Unmute microphone'}
+                  title={micOn ? 'Mute' : 'Unmute'}
+                >
+                  {micOn ? <Mic size={17} /> : <MicOff size={17} />}
+                </button>
+                <button
+                  type="button"
+                  className={`call-icon-btn ${camOn ? '' : 'off'}`}
+                  onClick={toggleCam}
+                  aria-label={camOn ? 'Turn camera off' : 'Turn camera on'}
+                  title={camOn ? 'Camera off' : 'Camera on'}
+                >
+                  {camOn ? <Video size={17} /> : <VideoOff size={17} />}
+                </button>
+                <button
+                  type="button"
+                  className="call-icon-btn danger"
+                  onClick={toggleCall}
+                  aria-label="End call"
+                  title="End call"
+                >
+                  <PhoneOff size={17} />
+                </button>
+              </>
+            )}
           </div>
         </section>
       </div>
 
-      <button
-        type="button"
-        className="leave-link"
-        onClick={() => setStatePartial({ roomId: '' })}
-      >
+      <button type="button" className="leave-link" onClick={() => setStatePartial({ roomId: '' })}>
         ← Leave room
       </button>
     </div>

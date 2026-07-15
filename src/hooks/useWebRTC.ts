@@ -1,18 +1,24 @@
 import { useEffect, useRef } from 'react';
 import { useAppStore } from '../store/useAppStore';
+import type { WireMessage } from '../types';
 
 const channelName = 'tempchat-channel';
 
-export function useWebRTC(onMessage: (text: string) => void, restartKey = 0) {
+type Handlers = {
+  onChat: (msg: Extract<WireMessage, { kind: 'chat' }>) => void;
+  onTyping: (isTyping: boolean) => void;
+};
+
+export function useWebRTC(handlers: Handlers, restartKey = 0) {
   const setStatePartial = useAppStore((s) => s.setStatePartial);
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const dataRef = useRef<RTCDataChannel | null>(null);
   const localRef = useRef<MediaStream | null>(null);
   const remoteRef = useRef<MediaStream | null>(null);
 
-  // Keep the latest onMessage callback without retriggering the effect
-  const onMessageRef = useRef(onMessage);
-  onMessageRef.current = onMessage;
+  // Keep latest handlers without retriggering the connection effect
+  const handlersRef = useRef(handlers);
+  handlersRef.current = handlers;
 
   useEffect(() => {
     const pc = new RTCPeerConnection({
@@ -39,18 +45,11 @@ export function useWebRTC(onMessage: (text: string) => void, restartKey = 0) {
       event.streams[0]?.getTracks().forEach((track) => {
         remoteStream.addTrack(track);
       });
-      window.dispatchEvent(
-        new CustomEvent('tempchat:remote-stream', {
-          detail: remoteStream,
-        }),
-      );
+      window.dispatchEvent(new CustomEvent('tempchat:remote-stream', { detail: remoteStream }));
     };
 
     pc.onconnectionstatechange = () => {
-      const state = pc.connectionState;
-      setStatePartial({
-        connected: state === 'connected',
-      });
+      setStatePartial({ connected: pc.connectionState === 'connected' });
     };
 
     return () => {
@@ -74,15 +73,23 @@ export function useWebRTC(onMessage: (text: string) => void, restartKey = 0) {
       setStatePartial({ connected: false });
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [setStatePartial, restartKey]); // <-- removed onMessage from deps
+  }, [setStatePartial, restartKey]);
 
   function bindChannel(channel: RTCDataChannel) {
     channel.onopen = () => setStatePartial({ connected: true });
     channel.onclose = () => setStatePartial({ connected: false });
     channel.onerror = () => setStatePartial({ connected: false });
     channel.onmessage = (event) => {
-      if (typeof event.data === 'string') {
-        onMessageRef.current(event.data);
+      if (typeof event.data !== 'string') return;
+      try {
+        const wire = JSON.parse(event.data) as WireMessage;
+        if (wire.kind === 'chat') {
+          handlersRef.current.onChat(wire);
+        } else if (wire.kind === 'typing') {
+          handlersRef.current.onTyping(wire.isTyping);
+        }
+      } catch {
+        // ignore malformed payloads
       }
     };
   }
@@ -128,28 +135,41 @@ export function useWebRTC(onMessage: (text: string) => void, restartKey = 0) {
   async function startCall() {
     const pc = peerRef.current;
     if (!pc) throw new Error('Peer connection unavailable');
-    if (localRef.current) {
-      return localRef.current;
-    }
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: true,
-      audio: true,
-    });
+    if (localRef.current) return localRef.current;
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
     localRef.current = stream;
-    stream.getTracks().forEach((track) => {
-      pc.addTrack(track, stream);
-    });
-    window.dispatchEvent(
-      new CustomEvent('tempchat:local-stream', {
-        detail: stream,
-      }),
-    );
+    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+    window.dispatchEvent(new CustomEvent('tempchat:local-stream', { detail: stream }));
     return stream;
   }
 
-  function sendText(text: string) {
+  function endCall() {
+    localRef.current?.getTracks().forEach((track) => track.stop());
+    localRef.current = null;
+    const pc = peerRef.current;
+    if (pc) {
+      pc.getSenders().forEach((sender) => {
+        if (sender.track) {
+          try {
+            pc.removeTrack(sender);
+          } catch {}
+        }
+      });
+    }
+    window.dispatchEvent(new CustomEvent('tempchat:local-stream', { detail: null }));
+  }
+
+  function toggleAudio(enabled: boolean) {
+    localRef.current?.getAudioTracks().forEach((t) => (t.enabled = enabled));
+  }
+
+  function toggleVideo(enabled: boolean) {
+    localRef.current?.getVideoTracks().forEach((t) => (t.enabled = enabled));
+  }
+
+  function send(wire: WireMessage) {
     if (dataRef.current?.readyState === 'open') {
-      dataRef.current.send(text);
+      dataRef.current.send(JSON.stringify(wire));
     }
   }
 
@@ -157,19 +177,19 @@ export function useWebRTC(onMessage: (text: string) => void, restartKey = 0) {
     const pc = peerRef.current;
     if (!pc) return () => {};
     pc.onicecandidate = (event) => {
-      if (event.candidate) {
-        callback(event.candidate);
-      }
+      if (event.candidate) callback(event.candidate);
     };
     return () => {
-      if (peerRef.current === pc) {
-        pc.onicecandidate = null;
-      }
+      if (peerRef.current === pc) pc.onicecandidate = null;
     };
   }
 
   function getConnectionState(): RTCPeerConnectionState | 'unknown' {
     return peerRef.current?.connectionState ?? 'unknown';
+  }
+
+  function hasLocalStream() {
+    return !!localRef.current;
   }
 
   function destroy() {
@@ -182,16 +202,8 @@ export function useWebRTC(onMessage: (text: string) => void, restartKey = 0) {
     localRef.current = null;
     remoteRef.current = null;
     setStatePartial({ connected: false });
-    window.dispatchEvent(
-      new CustomEvent('tempchat:local-stream', {
-        detail: null,
-      }),
-    );
-    window.dispatchEvent(
-      new CustomEvent('tempchat:remote-stream', {
-        detail: null,
-      }),
-    );
+    window.dispatchEvent(new CustomEvent('tempchat:local-stream', { detail: null }));
+    window.dispatchEvent(new CustomEvent('tempchat:remote-stream', { detail: null }));
   }
 
   return {
@@ -200,9 +212,13 @@ export function useWebRTC(onMessage: (text: string) => void, restartKey = 0) {
     acceptRemoteAnswer,
     addIceCandidate,
     startCall,
-    sendText,
+    endCall,
+    toggleAudio,
+    toggleVideo,
+    send,
     onIceCandidate,
     destroy,
     getConnectionState,
+    hasLocalStream,
   };
 }
