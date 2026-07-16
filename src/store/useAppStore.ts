@@ -18,7 +18,6 @@ export type ConnectionStatus =
   | 'error';
 
 export type ToastTone = 'success' | 'error' | 'info';
-
 export type ToastItem = {
   id: string;
   title: string;
@@ -30,7 +29,6 @@ function systemPrefersDark(): boolean {
   if (typeof window === 'undefined' || !window.matchMedia) return true;
   return window.matchMedia('(prefers-color-scheme: dark)').matches;
 }
-
 function resolveTheme(mode: ThemeMode): ResolvedTheme {
   if (mode === 'system') return systemPrefersDark() ? 'dark' : 'light';
   return mode;
@@ -38,27 +36,23 @@ function resolveTheme(mode: ThemeMode): ResolvedTheme {
 
 type State = {
   roomId: string;
+  peerId: string;
   nickname: string;
   secret: string;
   connected: boolean;
   connectionStatus: ConnectionStatus;
   activeTab: 'chat' | 'call';
   roomFull: boolean;
-
   themeMode: ThemeMode;
   resolvedTheme: ResolvedTheme;
-
   isOnline: boolean;
   draft: string;
-
   messages: PlainMessage[];
   unreadCount: number;
   toasts: ToastItem[];
-
   voiceMessage: VoiceMessageState;
   groupInfo: GroupRoomInfo | null;
   participants: RoomParticipant[];
-
   setStatePartial: (value: Partial<State>) => void;
   addMessage: (message: PlainMessage) => void;
   markMessageDelivered: (messageId: string, at: number) => void;
@@ -98,34 +92,28 @@ const initialVoiceMessage: VoiceMessageState = {
 
 export const useAppStore = create<State>((set) => ({
   roomId: '',
+  peerId: '',
   nickname: '',
   secret: '',
   connected: false,
   connectionStatus: 'idle',
   activeTab: 'chat',
   roomFull: false,
-
   themeMode: initialThemeMode,
   resolvedTheme: initialResolved,
-
   isOnline: typeof navigator === 'undefined' ? true : navigator.onLine,
   draft: '',
-
   messages: [],
   unreadCount: 0,
   toasts: [],
-
   voiceMessage: initialVoiceMessage,
   groupInfo: null,
   participants: [],
-
   setStatePartial: (value) => set((state) => ({ ...state, ...value })),
-
   addMessage: (message) =>
     set((state) => ({
       messages: [...state.messages, message],
     })),
-
   markMessageDelivered: (messageId, at) =>
     set((state) => ({
       messages: state.messages.map((msg) =>
@@ -137,7 +125,6 @@ export const useAppStore = create<State>((set) => ({
           : msg,
       ),
     })),
-
   markMessageSeen: (messageId, at) =>
     set((state) => ({
       messages: state.messages.map((msg) =>
@@ -150,26 +137,20 @@ export const useAppStore = create<State>((set) => ({
           : msg,
       ),
     })),
-
   setConnectionStatus: (status) => set({ connectionStatus: status }),
   setActiveTab: (tab) => set({ activeTab: tab }),
-
   setThemeMode: (mode) => {
     const resolved = resolveTheme(mode);
     applyThemeToDocument(resolved);
     set({ themeMode: mode, resolvedTheme: resolved });
   },
-
   setDraft: (draft) => set({ draft }),
   setOnline: (online) => set({ isOnline: online }),
-
   incrementUnread: () =>
     set((state) => ({
       unreadCount: state.unreadCount + 1,
     })),
-
   resetUnread: () => set({ unreadCount: 0 }),
-
   pushToast: (toast) =>
     set((state) => ({
       toasts: [
@@ -180,25 +161,21 @@ export const useAppStore = create<State>((set) => ({
         },
       ],
     })),
-
   dismissToast: (id) =>
     set((state) => ({
       toasts: state.toasts.filter((toast) => toast.id !== id),
     })),
-
   clearToasts: () => set({ toasts: [] }),
-
   setVoiceMessage: (partial) =>
     set((state) => ({
       voiceMessage: { ...state.voiceMessage, ...partial },
     })),
-
   setGroupInfo: (info) => set({ groupInfo: info }),
   setParticipants: (participants) => set({ participants }),
-
   reset: () =>
     set((state) => ({
       roomId: '',
+      peerId: '',
       nickname: '',
       secret: '',
       connected: false,

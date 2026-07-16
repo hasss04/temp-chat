@@ -1,10 +1,11 @@
 import { useState } from 'react';
-import { MessageCircle, ArrowRight, Shuffle } from 'lucide-react';
+import { MessageCircle, ArrowRight, Shuffle, Eye, EyeOff } from 'lucide-react';
 import { generateRoomId } from '../lib/roomId';
 import { createRoom } from '../lib/signaling';
 import { persistSession, restoreMessages } from '../lib/storage';
 import { useAppStore } from '../store/useAppStore';
 import { ThemeToggle } from './ThemeToggle';
+import { SessionsList } from './SessionsList';
 
 export function SetupPanel() {
   const setStatePartial = useAppStore((s) => s.setStatePartial);
@@ -15,8 +16,13 @@ export function SetupPanel() {
   const [roomIdInput, setRoomIdInput] = useState('');
   const [secret, setSecret] = useState('');
   const [loading, setLoading] = useState(false);
+  const [showSecret, setShowSecret] = useState(false);
 
-  async function enterRoom(roomId: string, roomType: 'private' | 'group' = 'private') {
+  async function enterRoom(
+    roomId: string,
+    roomType: 'private' | 'group' = 'private',
+    existingPeerId?: string,
+  ) {
     const trimmedRoom = roomId.trim().toLowerCase();
     const trimmedSecret = secret.trim();
     const trimmedName = nickname.trim() || 'Anon';
@@ -42,10 +48,12 @@ export function SetupPanel() {
     setLoading(true);
 
     try {
+      const peerId = existingPeerId ?? crypto.randomUUID();
       const messages = await restoreMessages(trimmedRoom, trimmedSecret).catch(() => []);
 
       setStatePartial({
         roomId: trimmedRoom,
+        peerId,
         nickname: trimmedName,
         secret: trimmedSecret,
         connectionStatus: 'joining',
@@ -66,6 +74,7 @@ export function SetupPanel() {
 
       await persistSession({
         roomId: trimmedRoom,
+        peerId,
         nickname: trimmedName,
         secret: trimmedSecret,
         activeTab: 'chat',
@@ -105,14 +114,16 @@ export function SetupPanel() {
     setRoomIdInput(roomId);
     setLoading(true);
 
+    const peerId = crypto.randomUUID();
+
     try {
-      await createRoom(roomId, crypto.randomUUID(), {
+      await createRoom(roomId, peerId, {
         type: 'group',
         nickname: trimmedName,
         maxPeers: 12,
       });
 
-      await enterRoom(roomId, 'group');
+      await enterRoom(roomId, 'group', peerId);
     } catch (error) {
       setLoading(false);
       pushToast({
@@ -183,15 +194,27 @@ export function SetupPanel() {
 
           <label className="setup-field">
             <span>Passphrase</span>
-            <input
-              value={secret}
-              onChange={(e) => setSecret(e.target.value)}
-              placeholder="Shared encryption passphrase"
-              type="password"
-              autoComplete="off"
-              aria-label="Encryption passphrase"
-              disabled={loading}
-            />
+            <div className="setup-password-row">
+              <input
+                value={secret}
+                onChange={(e) => setSecret(e.target.value)}
+                placeholder="Shared encryption passphrase"
+                type={showSecret ? 'text' : 'password'}
+                autoComplete="off"
+                aria-label="Encryption passphrase"
+                disabled={loading}
+              />
+              <button
+                type="button"
+                className="setup-password-toggle"
+                onClick={() => setShowSecret((v) => !v)}
+                aria-label={showSecret ? 'Hide passphrase' : 'Show passphrase'}
+                title={showSecret ? 'Hide passphrase' : 'Show passphrase'}
+                disabled={loading}
+              >
+                {showSecret ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
           </label>
 
           <button type="submit" className="setup-primary-btn" disabled={loading}>
@@ -212,6 +235,8 @@ export function SetupPanel() {
         >
           {loading ? 'Creating…' : 'Create a new room'}
         </button>
+
+        <SessionsList />
       </div>
     </div>
   );

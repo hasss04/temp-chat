@@ -1,3 +1,5 @@
+import { publishRoomWake } from './realtime';
+
 const API_BASE = import.meta.env.VITE_API_BASE || '/.netlify/functions';
 
 export type ParticipantPayload = {
@@ -45,7 +47,6 @@ export class SignalError extends Error {
   code: SignalErrorCode;
   status: number;
   detail?: string;
-
   constructor(code: SignalErrorCode, message: string, status = 500, detail?: string) {
     super(message);
     this.name = 'SignalError';
@@ -58,22 +59,18 @@ export class SignalError extends Error {
 async function call(roomId: string, method: string, peerId?: string, body?: unknown) {
   const qs = new URLSearchParams({ roomId });
   if (peerId) qs.set('peerId', peerId);
-
   const res = await fetch(`${API_BASE}/presence?${qs.toString()}`, {
     method,
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   });
-
   if (!res.ok) {
     let payload: ErrorPayload | null = null;
-
     try {
       payload = (await res.json()) as ErrorPayload;
     } catch {
       payload = null;
     }
-
     throw new SignalError(
       payload?.code ?? 'UNKNOWN',
       payload?.message ?? `presence ${method} failed`,
@@ -81,13 +78,12 @@ async function call(roomId: string, method: string, peerId?: string, body?: unkn
       payload?.detail,
     );
   }
-
   return (await res.json()) as RoomPayload;
 }
 
 export const getRoom = (roomId: string) => call(roomId, 'GET');
 
-export const createRoom = (
+export const createRoom = async (
   roomId: string,
   peerId: string,
   options?: {
@@ -95,79 +91,90 @@ export const createRoom = (
     nickname?: string;
     maxPeers?: number;
   },
-) =>
-  call(roomId, 'POST', peerId, {
+) => {
+  const room = await call(roomId, 'POST', peerId, {
     type: options?.type ?? 'private',
     nickname: options?.nickname,
     maxPeers: options?.maxPeers,
   });
+  publishRoomWake(roomId);
+  return room;
+};
 
-export const joinRoom = (roomId: string, peerId: string, nickname?: string) =>
-  call(roomId, 'POST', peerId, nickname ? { nickname } : {});
+export const joinRoom = async (roomId: string, peerId: string, nickname?: string) => {
+  const room = await call(roomId, 'POST', peerId, nickname ? { nickname } : {});
+  // Tell everyone already in the room "a new peer just showed up" so their
+  // waiting/polling loop wakes immediately instead of on its next tick.
+  publishRoomWake(roomId);
+  return room;
+};
 
-export const leaveRoom = (roomId: string, peerId?: string) =>
-  call(roomId, 'DELETE', peerId).catch(() => {});
+export const leaveRoom = async (roomId: string, peerId?: string) => {
+  try {
+    const room = await call(roomId, 'DELETE', peerId);
+    publishRoomWake(roomId);
+    return room;
+  } catch {
+    return undefined;
+  }
+};
 
-export const postOffer = (
+export const postOffer = async (
   roomId: string,
   peerId: string,
   offer: RTCSessionDescriptionInit,
   targetPeerId?: string,
-) =>
-  call(roomId, 'POST', peerId, {
+) => {
+  const room = await call(roomId, 'POST', peerId, {
     offer: JSON.stringify(offer),
     ...(targetPeerId ? { targetPeerId } : {}),
   });
+  publishRoomWake(roomId);
+  return room;
+};
 
-export const postAnswer = (
+export const postAnswer = async (
   roomId: string,
   peerId: string,
   answer: RTCSessionDescriptionInit,
   targetPeerId?: string,
-) =>
-  call(roomId, 'POST', peerId, {
+) => {
+  const room = await call(roomId, 'POST', peerId, {
     answer: JSON.stringify(answer),
     ...(targetPeerId ? { targetPeerId } : {}),
   });
+  publishRoomWake(roomId);
+  return room;
+};
 
-export const postIce = (
+export const postIce = async (
   roomId: string,
   peerId: string,
   candidate: RTCIceCandidateInit,
   targetPeerId?: string,
-) =>
-  call(roomId, 'POST', peerId, {
+) => {
+  const room = await call(roomId, 'POST', peerId, {
     ice: [JSON.stringify(candidate)],
     ...(targetPeerId ? { targetPeerId } : {}),
   });
+  publishRoomWake(roomId);
+  return room;
+};
 
-export async function determineRole(
-  roomId: string,
+/**
+ * Pure, synchronous role derivation from a room snapshot you already have
+ * (e.g. the response from joinRoom). No network round trip, no polling.
+ * Returns 'waiting' only when you are genuinely the first peer in the room.
+ */
+export function deriveRole(
+  room: RoomPayload,
   peerId: string,
-): Promise<'offerer' | 'answerer'> {
-  for (let i = 0; i < 20; i++) {
-    try {
-      const room = await getRoom(roomId);
-
-      if (room.type === 'group') {
-        const sorted = [...room.peers].sort();
-        return sorted[0] === peerId ? 'offerer' : 'answerer';
-      }
-
-      if (room.offer && room.peers.length > 1) return 'answerer';
-
-      if (room.peers.length >= 2) {
-        const sorted = [...room.peers].sort();
-        return sorted[0] === peerId ? 'offerer' : 'answerer';
-      }
-    } catch (error) {
-      if (error instanceof SignalError && error.code === 'ROOM_FULL') {
-        throw error;
-      }
-    }
-
-    await new Promise((r) => setTimeout(r, 400));
+): 'offerer' | 'answerer' | 'waiting' {
+  if (room.type === 'group') {
+    const sorted = [...room.peers].sort();
+    return sorted[0] === peerId ? 'offerer' : 'answerer';
   }
-
-  return 'offerer';
+  if (room.peers.length < 2) return 'waiting';
+  const sorted = [...room.peers].sort();
+  return sorted[0] === peerId ? 'offerer' : 'answerer';
 }

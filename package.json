@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@netlify/blobs": "^9.1.2",
+    "ably": "^2.24.0",
     "idb": "^8.0.0",
     "lucide-react": "^0.525.0",
     "react": "^18.3.1",

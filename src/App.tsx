@@ -1,8 +1,8 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useState } from 'react';
 import { SignalBridge } from './components/SignalBridge';
 import { SetupPanel } from './components/SetupPanel';
 import { ToastHost } from './components/ToastHost';
-import { restoreMessages, restoreSession } from './lib/storage';
+import { restoreMessages, restoreActiveSession } from './lib/storage';
 import { useAppStore, watchOnlineStatus, watchSystemTheme } from './store/useAppStore';
 
 export default function App() {
@@ -11,7 +11,7 @@ export default function App() {
   const setThemeMode = useAppStore((s) => s.setThemeMode);
   const pushToast = useAppStore((s) => s.pushToast);
 
-  const hydratedRef = useRef(false);
+  const [hydrating, setHydrating] = useState(true);
 
   useEffect(() => {
     const stopThemeWatch = watchSystemTheme();
@@ -24,28 +24,37 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (hydratedRef.current) return;
-    hydratedRef.current = true;
+    let cancelled = false;
 
-    let disposed = false;
+    setHydrating(true);
 
     void (async () => {
       try {
-        const session = await restoreSession().catch(() => undefined);
-        if (disposed || !session) return;
+        const session = await restoreActiveSession().catch(() => undefined);
+
+        if (cancelled) return;
+
+        if (!session) {
+          setHydrating(false);
+          return;
+        }
 
         if (session.theme) {
           setThemeMode(session.theme);
         }
 
-        if (!session.roomId || !session.secret) return;
+        if (!session.roomId || !session.secret) {
+          setHydrating(false);
+          return;
+        }
 
         const messages = await restoreMessages(session.roomId, session.secret).catch(() => []);
 
-        if (disposed) return;
+        if (cancelled) return;
 
         setStatePartial({
           roomId: session.roomId,
+          peerId: session.peerId,
           nickname: session.nickname?.trim() || 'Anon',
           secret: session.secret,
           activeTab: session.activeTab ?? 'chat',
@@ -55,21 +64,34 @@ export default function App() {
           roomFull: false,
         });
       } catch (error) {
-        console.error('Failed to restore app session', error);
-        if (!disposed) {
+        if (!cancelled) {
+          console.error('Failed to restore app session', error);
           pushToast({
             tone: 'error',
             title: 'Session restore failed',
             message: 'Local room state could not be restored on this device.',
           });
         }
+      } finally {
+        if (!cancelled) {
+          setHydrating(false);
+        }
       }
     })();
 
     return () => {
-      disposed = true;
+      cancelled = true;
     };
   }, [pushToast, setStatePartial, setThemeMode]);
+
+  if (hydrating) {
+    return (
+      <div className="app-shell">
+        <div style={{ padding: 20 }}>Loading…</div>
+        <ToastHost />
+      </div>
+    );
+  }
 
   return (
     <div className="app-shell">

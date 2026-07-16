@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Trash2, Phone, Video, WifiOff, Users } from 'lucide-react';
+import { Trash2, Phone, Video, WifiOff, Users, LogOut } from 'lucide-react';
 import {
   SignalError,
-  determineRole,
+  deriveRole,
   getRoom,
   joinRoom,
   leaveRoom,
@@ -10,6 +10,7 @@ import {
   postIce,
   postOffer,
 } from '../lib/signaling';
+import { initRealtime, subscribeRoomEvents, closeRealtimeClient } from '../lib/realtime';
 import { clearPersistedSession, persistMessages, persistSession, wipeRoom } from '../lib/storage';
 import { useAppStore } from '../store/useAppStore';
 import { useWebRTC } from '../hooks/useWebRTC';
@@ -20,7 +21,8 @@ import { VoiceCallView } from './VoiceCallView';
 import { VideoCallView } from './VideoCallView';
 import type { CallPhase, CallQuality, CallType } from '../types';
 
-type Role = 'offerer' | 'answerer';
+type DerivedRole = 'waiting' | 'offerer' | 'answerer';
+type ActiveRole = 'offerer' | 'answerer';
 
 function initialsOf(name: string) {
   return (name || 'A').trim().slice(0, 2).toUpperCase();
@@ -48,11 +50,11 @@ export function SignalBridge() {
   const setGroupInfo = useAppStore((s) => s.setGroupInfo);
   const setParticipants = useAppStore((s) => s.setParticipants);
   const participants = useAppStore((s) => s.participants);
+  const storedPeerId = useAppStore((s) => s.peerId);
 
-  const [role, setRole] = useState<Role | null>(null);
+  const [role, setRole] = useState<ActiveRole | null>(null);
   const [restartKey, setRestartKey] = useState(0);
   const [peerTyping, setPeerTyping] = useState(false);
-
   const [callType, setCallType] = useState<CallType | null>(null);
   const [callPhase, setCallPhase] = useState<CallPhase>('idle');
   const [micOn, setMicOn] = useState(true);
@@ -65,7 +67,7 @@ export function SignalBridge() {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
 
-  const peerId = useMemo(() => crypto.randomUUID(), []);
+  const peerId = useMemo(() => storedPeerId || crypto.randomUUID(), [storedPeerId]);
   const appliedIce = useRef<Record<string, number>>({});
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const answerAppliedRef = useRef(false);
@@ -76,6 +78,10 @@ export function SignalBridge() {
   const isCallInitiatorRef = useRef(false);
   const joinedRef = useRef(false);
   const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
+  const offSignalRef = useRef<(() => void) | null>(null);
+  const groupUnsubRef = useRef<(() => void) | null>(null);
+  const groupInfoRef = useRef(groupInfo);
+  groupInfoRef.current = groupInfo;
 
   const rtcApi = useWebRTC(
     {
@@ -87,7 +93,6 @@ export function SignalBridge() {
           receipt: 'delivered',
           at: Date.now(),
         });
-
         if (document.visibilityState === 'visible' && activeTab === 'chat') {
           rtcApiRef.current.send({
             kind: 'receipt',
@@ -112,7 +117,7 @@ export function SignalBridge() {
         }
       },
       onCallSignal: (wire) => {
-        if (groupInfo?.isGroup) {
+        if (groupInfoRef.current?.isGroup) {
           pushToast({
             tone: 'info',
             title: 'Group call unavailable',
@@ -120,7 +125,6 @@ export function SignalBridge() {
           });
           return;
         }
-
         if (wire.kind === 'call-invite') {
           isCallInitiatorRef.current = false;
           setCallType(wire.callType ?? 'voice');
@@ -194,6 +198,7 @@ export function SignalBridge() {
     if (!roomId || !secret) return;
     persistSession({
       roomId,
+      peerId,
       nickname,
       secret,
       activeTab,
@@ -201,15 +206,15 @@ export function SignalBridge() {
       draft,
       lastSeenAt: Date.now(),
     }).catch(() => {});
-  }, [roomId, nickname, secret, activeTab, themeMode, draft]);
+  }, [roomId, peerId, nickname, secret, activeTab, themeMode, draft]);
 
   useEffect(() => {
     if (!roomId || !secret) return;
     if (draftPersistTimeoutRef.current) clearTimeout(draftPersistTimeoutRef.current);
-
     draftPersistTimeoutRef.current = setTimeout(() => {
       persistSession({
         roomId,
+        peerId,
         nickname,
         secret,
         activeTab,
@@ -218,16 +223,14 @@ export function SignalBridge() {
         lastSeenAt: Date.now(),
       }).catch(() => {});
     }, 400);
-
     return () => {
       if (draftPersistTimeoutRef.current) clearTimeout(draftPersistTimeoutRef.current);
     };
-  }, [draft, roomId, secret, nickname, activeTab, themeMode]);
+  }, [draft, roomId, secret, peerId, nickname, activeTab, themeMode]);
 
   useEffect(() => {
-    let myRole: Role | null = null;
+    let myRole: DerivedRole = 'waiting';
     let cancelled = false;
-
     joinedRef.current = false;
     pendingIceRef.current = [];
     answerAppliedRef.current = false;
@@ -263,12 +266,59 @@ export function SignalBridge() {
       }
     }
 
+    async function syncOnce() {
+      if (groupInfoRef.current?.isGroup || cancelled) return;
+      if (rtcApi.getConnectionState() === 'connected') return;
+
+      try {
+        const room = await getRoom(roomId);
+
+        if (myRole === 'answerer' && !answerAppliedRef.current && room.offer) {
+          const answer = await rtcApi.acceptRemoteOffer(JSON.parse(room.offer));
+          await postAnswer(roomId, peerId, answer);
+          answerAppliedRef.current = true;
+        }
+
+        if (myRole === 'offerer' && room.answer && !connected) {
+          await rtcApi.acceptRemoteAnswer(JSON.parse(room.answer));
+        }
+
+        for (const [otherId, candidates] of Object.entries(room.ice ?? {})) {
+          if (otherId === peerId) continue;
+          const applied = appliedIce.current[otherId] ?? 0;
+          for (let i = applied; i < candidates.length; i++) {
+            await rtcApi.addIceCandidate(JSON.parse(candidates[i]));
+          }
+          appliedIce.current[otherId] = candidates.length;
+        }
+      } catch (error) {
+        if (error instanceof SignalError && error.code === 'ROOM_FULL') {
+          if (!cancelled) {
+            setStatePartial({ connectionStatus: 'error', roomFull: true });
+            pushToast({
+              tone: 'error',
+              title: 'Room full',
+              message: 'This room is currently occupied. Please wait until one participant leaves.',
+            });
+          }
+          return;
+        }
+
+        if (!cancelled && rtcApi.getConnectionState() !== 'connected') {
+          setStatePartial({ connectionStatus: 'error' });
+        }
+      }
+    }
+
     void (async () => {
       try {
         setStatePartial({
           connectionStatus: restartKey > 0 ? 'reconnecting' : 'joining',
           roomFull: false,
+          peerId,
         });
+
+        initRealtime(peerId);
 
         if (restartKey > 0) {
           await leaveRoom(roomId, peerId).catch(() => {});
@@ -297,60 +347,61 @@ export function SignalBridge() {
             maxParticipants: joinedRoom.maxPeers ?? 12,
           });
           setStatePartial({ connectionStatus: 'connected', connected: true });
+
+          const unsubGroup = subscribeRoomEvents(roomId, async () => {
+            try {
+              const room = await getRoom(roomId);
+              const updated =
+                room.participants?.map((p) => ({
+                  peerId: p.peerId,
+                  nickname: p.nickname || 'Anon',
+                  status: 'online' as const,
+                  joinedAt: p.joinedAt,
+                })) ?? [];
+              setParticipants(updated);
+              setGroupInfo({
+                roomId,
+                isGroup: true,
+                participants: updated,
+                maxParticipants: room.maxPeers ?? 12,
+              });
+            } catch {
+              // ignore transient issues
+            }
+          });
+
+          groupUnsubRef.current = unsubGroup;
           return;
         }
 
         setGroupInfo(null);
 
-        myRole = await determineRole(roomId, peerId);
-        if (cancelled) return;
-        setRole(myRole);
+        const roleStartedRef = { current: false }; // local to this effect run
+        let myRole: DerivedRole = 'waiting';
 
-        if (myRole === 'offerer') {
-          setStatePartial({ connectionStatus: 'waiting' });
-          const offer = await rtcApi.createLocalOffer();
-          await postOffer(roomId, peerId, offer);
-        } else {
-          setStatePartial({ connectionStatus: 'connecting' });
-          const room = await getRoom(roomId);
-          if (room.offer) {
-            const answer = await rtcApi.acceptRemoteOffer(JSON.parse(room.offer));
-            await postAnswer(roomId, peerId, answer);
-            answerAppliedRef.current = true;
-          }
-        }
-
-        pollRef.current = setInterval(async () => {
-          if (groupInfo?.isGroup) return;
-
-          if (rtcApi.getConnectionState() === 'connected') {
-            if (pollRef.current) {
-              clearInterval(pollRef.current);
-              pollRef.current = null;
-            }
-            return;
-          }
-
+        async function tryResolveRoleAndStart(seedRoom?: typeof joinedRoom) {
+          if (cancelled || roleStartedRef.current) return;
           try {
-            const room = await getRoom(roomId);
-
-            if (myRole === 'answerer' && !answerAppliedRef.current && room.offer) {
-              const answer = await rtcApi.acceptRemoteOffer(JSON.parse(room.offer));
-              await postAnswer(roomId, peerId, answer);
-              answerAppliedRef.current = true;
+            const room = seedRoom ?? (await getRoom(roomId));
+            const derived = deriveRole(room, peerId);
+            if (derived === 'waiting') {
+              setStatePartial({ connectionStatus: 'waiting' });
+              return; // still alone — listener/poll will retry us later
             }
-
-            if (myRole === 'offerer' && room.answer && !connected) {
-              await rtcApi.acceptRemoteAnswer(JSON.parse(room.answer));
-            }
-
-            for (const [otherId, candidates] of Object.entries(room.ice ?? {})) {
-              if (otherId === peerId) continue;
-              const applied = appliedIce.current[otherId] ?? 0;
-              for (let i = applied; i < candidates.length; i++) {
-                await rtcApi.addIceCandidate(JSON.parse(candidates[i]));
+            roleStartedRef.current = true;
+            myRole = derived;
+            setRole(derived);
+            if (derived === 'offerer') {
+              setStatePartial({ connectionStatus: 'waiting' });
+              const offer = await rtcApi.createLocalOffer();
+              await postOffer(roomId, peerId, offer);
+            } else {
+              setStatePartial({ connectionStatus: 'connecting' });
+              if (room.offer) {
+                const answer = await rtcApi.acceptRemoteOffer(JSON.parse(room.offer));
+                await postAnswer(roomId, peerId, answer);
+                answerAppliedRef.current = true;
               }
-              appliedIce.current[otherId] = candidates.length;
             }
           } catch (error) {
             if (error instanceof SignalError && error.code === 'ROOM_FULL') {
@@ -364,19 +415,47 @@ export function SignalBridge() {
               }
               return;
             }
-
             if (!cancelled && rtcApi.getConnectionState() !== 'connected') {
               setStatePartial({ connectionStatus: 'error' });
             }
           }
-        }, 1200);
+        }
+
+        // Event-driven: whenever anything changes in the room (peer joins,
+        // offer/answer/ICE posted), re-check role (if unresolved) and resync.
+        const unsubSignal = subscribeRoomEvents(roomId, () => {
+          void tryResolveRoleAndStart();
+          void syncOnce();
+        });
+        offSignalRef.current = unsubSignal;
+
+        // Fast path: try immediately using the snapshot we already have from
+        // joinRoom(), so a peer who arrives second connects instantly.
+        await tryResolveRoleAndStart(joinedRoom);
+        void syncOnce();
+
+        // Unbounded safety-net: keeps retrying role resolution + sync every
+        // 4s for as long as the room stays open, instead of giving up after
+        // a fixed window. This is what lets a peer who's genuinely first
+        // just wait indefinitely for the second peer to show up.
+        pollRef.current = setInterval(() => {
+          if (rtcApi.getConnectionState() === 'connected') {
+            if (pollRef.current) {
+              clearInterval(pollRef.current);
+              pollRef.current = null;
+            }
+            return;
+          }
+          void tryResolveRoleAndStart();
+          void syncOnce();
+        }, 4000);
       } catch (error) {
         if (cancelled) return;
 
         setStatePartial({ connectionStatus: 'error' });
 
         if (error instanceof SignalError && error.code === 'ROOM_FULL') {
-          await clearPersistedSession().catch(() => {});
+          await clearPersistedSession(roomId).catch(() => {});
           setStatePartial({
             roomId: '',
             nickname: '',
@@ -406,6 +485,10 @@ export function SignalBridge() {
     return () => {
       cancelled = true;
       offIce();
+      offSignalRef.current?.();
+      offSignalRef.current = null;
+      groupUnsubRef.current?.();
+      groupUnsubRef.current = null;
 
       if (pollRef.current) {
         clearInterval(pollRef.current);
@@ -422,7 +505,18 @@ export function SignalBridge() {
       pendingIceRef.current = [];
       leaveRoom(roomId, peerId).catch(() => {});
     };
-  }, [connected, peerId, pushToast, roomId, restartKey, setStatePartial, nickname, rtcApi, setGroupInfo, setParticipants]);
+  }, [
+    connected,
+    peerId,
+    pushToast,
+    roomId,
+    restartKey,
+    setStatePartial,
+    nickname,
+    rtcApi,
+    setGroupInfo,
+    setParticipants,
+  ]);
 
   useEffect(() => {
     if (connected) setStatePartial({ connectionStatus: 'connected' });
@@ -431,7 +525,6 @@ export function SignalBridge() {
   useEffect(() => {
     function markVisibleMessagesSeen() {
       if (!connected || activeTab !== 'chat' || document.visibilityState !== 'visible') return;
-
       messages
         .filter((msg) => msg.sender === 'peer' && !msg.seenAt)
         .forEach((msg) => {
@@ -470,7 +563,6 @@ export function SignalBridge() {
 
   function handleDraftChange(value: string) {
     setDraft(value);
-
     if (groupInfo?.isGroup) return;
     if (!connected || !rtcApi.isDataChannelOpen()) return;
 
@@ -519,6 +611,7 @@ export function SignalBridge() {
     }
 
     if (!connected || callPhase !== 'idle') return;
+
     isCallInitiatorRef.current = true;
     setCallType(type);
     setCallPhase('outgoing');
@@ -527,6 +620,7 @@ export function SignalBridge() {
 
   async function acceptCall() {
     if (!callType) return;
+
     setCallPhase('connecting');
 
     try {
@@ -576,8 +670,9 @@ export function SignalBridge() {
   async function killSwitch() {
     rtcApi.destroy();
     await wipeRoom(roomId).catch(() => {});
-    await clearPersistedSession().catch(() => {});
+    await clearPersistedSession(roomId).catch(() => {});
     await leaveRoom(roomId, peerId).catch(() => {});
+    closeRealtimeClient();
     reset();
     pushToast({
       tone: 'success',
@@ -588,8 +683,9 @@ export function SignalBridge() {
 
   async function leaveRoomOnly() {
     rtcApi.destroy();
-    await clearPersistedSession().catch(() => {});
+    await clearPersistedSession(roomId).catch(() => {});
     await leaveRoom(roomId, peerId).catch(() => {});
+    closeRealtimeClient();
     setStatePartial({
       roomId: '',
       nickname: '',
@@ -700,6 +796,16 @@ export function SignalBridge() {
 
           <button
             type="button"
+            className="icon-action-btn"
+            onClick={() => void leaveRoomOnly()}
+            title="Leave room"
+            aria-label="Leave room"
+          >
+            <LogOut size={16} />
+          </button>
+
+          <button
+            type="button"
             className="icon-danger-btn"
             onClick={killSwitch}
             title="Wipe room and leave"
@@ -733,10 +839,6 @@ export function SignalBridge() {
           />
         </main>
       </div>
-
-      <button type="button" className="leave-link" onClick={() => void leaveRoomOnly()}>
-        Leave room
-      </button>
 
       {!groupInfo?.isGroup && callActive && callType === 'voice' && (
         <VoiceCallView
