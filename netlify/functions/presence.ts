@@ -28,13 +28,16 @@ type RoomPayload = {
   type: RoomType;
   maxPeers: number;
   signals: Record<string, Record<string, PeerSignalState>>;
+  passwordHash?: string;
 };
 
 type PresenceErrorCode =
   | 'BAD_REQUEST'
   | 'ROOM_FULL'
   | 'METHOD_NOT_ALLOWED'
-  | 'PRESENCE_FAILED';
+  | 'PRESENCE_FAILED'
+  | 'WRONG_PASSWORD'
+  | 'CONFLICT_RETRY_EXCEEDED';
 
 type PresenceBody = {
   offer?: string;
@@ -44,12 +47,17 @@ type PresenceBody = {
   maxPeers?: number;
   nickname?: string;
   targetPeerId?: string;
+  passwordHash?: string;
 };
 
 const EXPIRY_MS = 1000 * 60 * 30;
+const PARTICIPANT_STALE_MS = 1000 * 60 * 2;
 const DEFAULT_PRIVATE_MAX_PEERS = 2;
-const DEFAULT_GROUP_MAX_PEERS = 12;
-const MAX_GROUP_PEERS = 50;
+const DEFAULT_GROUP_MAX_PEERS = 10;
+const MAX_GROUP_PEERS = 10;
+const MAX_ICE_CANDIDATES_PER_PEER = 60;
+const WRITE_RETRY_ATTEMPTS = 4;
+const WRITE_RETRY_BASE_DELAY_MS = 60;
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -87,21 +95,67 @@ function getRoomStore() {
   const token = process.env.NETLIFY_AUTH_TOKEN;
 
   if (siteID && token) {
-    return getStore({ name: 'tempchat-rooms', siteID, token });
+    return getStore({
+      name: 'tempchat-rooms',
+      siteID,
+      token,
+    });
   }
 
   return getStore({ name: 'tempchat-rooms' });
 }
 
-function sanitizeRoomId(roomId: string): string {
+async function getRoomFresh(
+  store: ReturnType<typeof getRoomStore>,
+  roomId: string,
+): Promise<RoomPayload | null> {
+  return (await store.get(roomId, {
+    type: 'json',
+    consistency: 'strong',
+  })) as RoomPayload | null;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /timeout|timed out|ECONNRESET|ETIMEDOUT|network|5\d\d|rate.?limit/i.test(message);
+}
+
+async function withRetry<T>(
+  label: string,
+  attempts: number,
+  work: () => Promise<T>,
+): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await work();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientError(error) || attempt === attempts - 1) throw error;
+      const delay =
+        WRITE_RETRY_BASE_DELAY_MS * 2 ** attempt + Math.floor(Math.random() * 40);
+      console.warn(`[presence] ${label} attempt ${attempt + 1} failed, retrying in ${delay}ms`, error);
+      await sleep(delay);
+    }
+  }
+
+  throw lastError;
+}
+
+function sanitizeRoomId(roomId: string) {
   return roomId.trim().toLowerCase();
 }
 
-function sanitizePeerId(peerId: string): string {
+function sanitizePeerId(peerId: string) {
   return peerId.trim();
 }
 
-function sanitizeNickname(nickname?: string): string | undefined {
+function sanitizeNickname(nickname?: string) {
   if (!nickname) return undefined;
   const value = nickname.trim().slice(0, 40);
   return value || undefined;
@@ -111,13 +165,23 @@ function sanitizeRoomType(type?: string): RoomType {
   return type === 'group' ? 'group' : 'private';
 }
 
-function sanitizeMaxPeers(value: unknown, type: RoomType): number {
-  const fallback = type === 'group' ? DEFAULT_GROUP_MAX_PEERS : DEFAULT_PRIVATE_MAX_PEERS;
+function sanitizeMaxPeers(value: unknown, type: RoomType) {
+  if (type === 'private') return DEFAULT_PRIVATE_MAX_PEERS;
+  const fallback = DEFAULT_GROUP_MAX_PEERS;
   const num = Number(value);
   if (!Number.isFinite(num)) return fallback;
-
-  if (type === 'private') return DEFAULT_PRIVATE_MAX_PEERS;
   return Math.max(2, Math.min(MAX_GROUP_PEERS, Math.floor(num)));
+}
+
+function sanitizePasswordHash(passwordHash?: string) {
+  if (typeof passwordHash !== 'string') return undefined;
+  const value = passwordHash.trim().toLowerCase();
+  return value || undefined;
+}
+
+function capIceList(candidates: string[]) {
+  if (candidates.length <= MAX_ICE_CANDIDATES_PER_PEER) return candidates;
+  return candidates.slice(candidates.length - MAX_ICE_CANDIDATES_PER_PEER);
 }
 
 function emptyRoom(type: RoomType = 'private', maxPeers?: number): RoomPayload {
@@ -138,13 +202,20 @@ function emptyRoom(type: RoomType = 'private', maxPeers?: number): RoomPayload {
     type,
     maxPeers: resolvedMaxPeers,
     signals: {},
+    passwordHash: undefined,
   };
 }
 
-function createRoom(roomId: string, type: RoomType, maxPeers: number): RoomPayload {
+function createRoom(
+  roomId: string,
+  type: RoomType,
+  maxPeers: number,
+  passwordHash?: string,
+): RoomPayload {
   return {
     ...emptyRoom(type, maxPeers),
     roomId,
+    passwordHash,
   };
 }
 
@@ -152,59 +223,116 @@ function isFreshRoom(room: RoomPayload | null): room is RoomPayload {
   return !!room && Date.now() - room.updatedAt < EXPIRY_MS;
 }
 
+function dedupeStrings(values: string[]) {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function removePeer(room: RoomPayload, peerId: string) {
+  room.peers = room.peers.filter((p) => p !== peerId);
+  room.participants = room.participants.filter((p) => p.peerId !== peerId);
+  delete room.ice[peerId];
+  delete room.signals[peerId];
+
+  for (const fromPeer of Object.keys(room.signals)) {
+    if (room.signals[fromPeer]?.[peerId]) {
+      delete room.signals[fromPeer][peerId];
+    }
+    if (Object.keys(room.signals[fromPeer] ?? {}).length === 0) {
+      delete room.signals[fromPeer];
+    }
+  }
+
+  if (room.type === 'private') {
+    room.offer = undefined;
+    room.answer = undefined;
+  }
+}
+
+function isParticipantStale(p: Participant) {
+  return Date.now() - p.lastSeenAt > PARTICIPANT_STALE_MS;
+}
+
+function pruneStaleParticipants(room: RoomPayload) {
+  const stalePeerIds = new Set(
+    (room.participants ?? []).filter(isParticipantStale).map((p) => p.peerId),
+  );
+
+  if (stalePeerIds.size === 0) return room;
+
+  for (const peerId of stalePeerIds) {
+    removePeer(room, peerId);
+  }
+
+  return room;
+}
+
 function sanitizeRoom(room: RoomPayload): RoomPayload {
   const type: RoomType = room.type ?? 'private';
   const maxPeers = sanitizeMaxPeers(room.maxPeers, type);
 
-  const uniquePeers = Array.from(new Set(room.peers)).slice(0, maxPeers);
+  room.peers = dedupeStrings(room.peers ?? []);
+  room.participants = (room.participants ?? [])
+    .filter((p) => room.peers.includes(p.peerId))
+    .reduce<Participant[]>((acc, p) => {
+      if (acc.some((x) => x.peerId === p.peerId)) return acc;
+      acc.push({
+        peerId: p.peerId,
+        nickname: sanitizeNickname(p.nickname),
+        joinedAt: p.joinedAt,
+        lastSeenAt: p.lastSeenAt,
+      });
+      return acc;
+    }, []);
 
-  const participants = room.participants
-    .filter((p) => uniquePeers.includes(p.peerId))
-    .map((p) => ({
-      peerId: p.peerId,
-      nickname: sanitizeNickname(p.nickname),
-      joinedAt: p.joinedAt,
-      lastSeenAt: p.lastSeenAt,
-    }));
+  pruneStaleParticipants(room);
+
+  room.peers = dedupeStrings(room.peers).slice(0, maxPeers);
+  room.participants = room.participants.filter((p) => room.peers.includes(p.peerId));
 
   const ice: Record<string, string[]> = {};
-  for (const peerId of uniquePeers) {
-    ice[peerId] = Array.isArray(room.ice?.[peerId]) ? room.ice[peerId] : [];
+  for (const peerId of room.peers) {
+    const list = Array.isArray(room.ice?.[peerId]) ? room.ice[peerId] : [];
+    ice[peerId] = capIceList(list.filter((v): v is string => typeof v === 'string'));
   }
 
   const signals: Record<string, Record<string, PeerSignalState>> = {};
-  for (const fromPeer of uniquePeers) {
+  for (const fromPeer of room.peers) {
     const source = room.signals?.[fromPeer];
     if (!source || typeof source !== 'object') continue;
 
     const nextTargetMap: Record<string, PeerSignalState> = {};
     for (const toPeer of Object.keys(source)) {
-      if (!uniquePeers.includes(toPeer)) continue;
+      if (!room.peers.includes(toPeer)) continue;
       const item = source[toPeer];
       nextTargetMap[toPeer] = {
         offer: typeof item?.offer === 'string' ? item.offer : undefined,
         answer: typeof item?.answer === 'string' ? item.answer : undefined,
-        ice: Array.isArray(item?.ice) ? item.ice.filter((v) => typeof v === 'string') : [],
+        ice: capIceList(
+          Array.isArray(item?.ice)
+            ? item.ice.filter((v): v is string => typeof v === 'string')
+            : [],
+        ),
       };
     }
-    signals[fromPeer] = nextTargetMap;
-  }
 
-  const shouldKeepLegacyOffer = uniquePeers.length > 0 && type === 'private';
-  const shouldKeepLegacyAnswer = uniquePeers.length > 0 && type === 'private';
+    if (Object.keys(nextTargetMap).length > 0) {
+      signals[fromPeer] = nextTargetMap;
+    }
+  }
 
   return {
     roomId: room.roomId,
-    peers: uniquePeers,
-    participants,
-    offer: shouldKeepLegacyOffer ? room.offer : undefined,
-    answer: shouldKeepLegacyAnswer ? room.answer : undefined,
+    peers: room.peers,
+    participants: room.participants,
+    offer: type === 'private' && room.peers.length > 0 ? room.offer : undefined,
+    answer: type === 'private' && room.peers.length > 0 ? room.answer : undefined,
     ice,
     updatedAt: room.updatedAt,
     createdAt: room.createdAt,
     type,
     maxPeers,
     signals,
+    passwordHash: sanitizePasswordHash(room.passwordHash),
   };
 }
 
@@ -244,41 +372,36 @@ function parseBody(rawBody: string | null): PresenceBody {
 
   if (body.type !== undefined) {
     if (body.type !== 'private' && body.type !== 'group') {
-      throw new Error('type must be "private" or "group"');
+      throw new Error('type must be private or group');
     }
     next.type = body.type;
   }
 
   if (body.maxPeers !== undefined) {
-    if (typeof body.maxPeers !== 'number') {
-      throw new Error('maxPeers must be a number');
-    }
+    if (typeof body.maxPeers !== 'number') throw new Error('maxPeers must be a number');
     next.maxPeers = body.maxPeers;
   }
 
   if (body.nickname !== undefined) {
-    if (typeof body.nickname !== 'string') {
-      throw new Error('nickname must be a string');
-    }
+    if (typeof body.nickname !== 'string') throw new Error('nickname must be a string');
     next.nickname = body.nickname;
   }
 
   if (body.targetPeerId !== undefined) {
-    if (typeof body.targetPeerId !== 'string') {
-      throw new Error('targetPeerId must be a string');
-    }
+    if (typeof body.targetPeerId !== 'string') throw new Error('targetPeerId must be a string');
     next.targetPeerId = body.targetPeerId;
+  }
+
+  if (body.passwordHash !== undefined) {
+    if (typeof body.passwordHash !== 'string') throw new Error('passwordHash must be a string');
+    next.passwordHash = body.passwordHash;
   }
 
   return next;
 }
 
 function isJoinOnlyRequest(body: PresenceBody) {
-  return (
-    body.offer === undefined &&
-    body.answer === undefined &&
-    body.ice === undefined
-  );
+  return body.offer === undefined && body.answer === undefined && body.ice === undefined;
 }
 
 function ensureParticipant(room: RoomPayload, peerId: string, nickname?: string) {
@@ -301,48 +424,77 @@ function ensureParticipant(room: RoomPayload, peerId: string, nickname?: string)
   });
 }
 
-function removePeer(room: RoomPayload, peerId: string) {
-  room.peers = room.peers.filter((p) => p !== peerId);
-  room.participants = room.participants.filter((p) => p.peerId !== peerId);
-  delete room.ice[peerId];
-
-  if (room.signals[peerId]) {
-    delete room.signals[peerId];
-  }
-
-  for (const fromPeer of Object.keys(room.signals)) {
-    if (room.signals[fromPeer]?.[peerId]) {
-      delete room.signals[fromPeer][peerId];
-    }
-  }
-
-  if (room.type === 'private') {
-    room.offer = undefined;
-    room.answer = undefined;
-  }
-}
-
 async function saveRoom(
   store: ReturnType<typeof getRoomStore>,
   roomId: string,
   room: RoomPayload,
 ) {
-  await store.setJSON(roomId, room);
+  await withRetry('saveRoom', WRITE_RETRY_ATTEMPTS, () => store.setJSON(roomId, room));
+}
+
+async function loadMutateSave(
+  store: ReturnType<typeof getRoomStore>,
+  roomId: string,
+  mutate: (room: RoomPayload) => RoomPayload | Promise<RoomPayload>,
+): Promise<RoomPayload> {
+  let lastSeenUpdatedAt = -1;
+
+  for (let attempt = 0; attempt < WRITE_RETRY_ATTEMPTS; attempt += 1) {
+    const existing = await withRetry('loadRoom', WRITE_RETRY_ATTEMPTS, () =>
+      getRoomFresh(store, roomId),
+    );
+
+    let currentRoom = isFreshRoom(existing) ? sanitizeRoom(existing) : emptyRoom();
+    if (existing && !isFreshRoom(existing)) {
+      await store.delete(roomId).catch(() => {});
+    }
+
+    const beforeMutateUpdatedAt = currentRoom.updatedAt;
+    const mutated = await mutate(currentRoom);
+    mutated.updatedAt = Date.now();
+    const finalRoom = sanitizeRoom(mutated);
+
+    if (attempt === 0 || beforeMutateUpdatedAt === lastSeenUpdatedAt) {
+      lastSeenUpdatedAt = beforeMutateUpdatedAt;
+      try {
+        await saveRoom(store, roomId, finalRoom);
+        return finalRoom;
+      } catch (error) {
+        if (attempt === WRITE_RETRY_ATTEMPTS - 1) throw error;
+        await sleep(WRITE_RETRY_BASE_DELAY_MS * (attempt + 1));
+      }
+    } else {
+      lastSeenUpdatedAt = beforeMutateUpdatedAt;
+    }
+  }
+
+  throw new PresenceHandledError(
+    409,
+    'CONFLICT_RETRY_EXCEEDED',
+    'Could not update room due to concurrent changes.',
+  );
+}
+
+class PresenceHandledError extends Error {
+  statusCode: number;
+  code: PresenceErrorCode;
+
+  constructor(statusCode: number, code: PresenceErrorCode, message: string) {
+    super(message);
+    this.name = 'PresenceHandledError';
+    this.statusCode = statusCode;
+    this.code = code;
+  }
 }
 
 export const handler: Handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') {
-    return {
-      statusCode: 204,
-      headers: corsHeaders,
-      body: '',
-    };
+    return { statusCode: 204, headers: corsHeaders, body: '' };
   }
 
   try {
     const rawRoomId = event.queryStringParameters?.roomId ?? '';
     const rawPeerId = event.queryStringParameters?.peerId ?? '';
-
     const roomId = sanitizeRoomId(rawRoomId);
     const peerId = sanitizePeerId(rawPeerId);
 
@@ -351,25 +503,20 @@ export const handler: Handler = async (event) => {
     }
 
     const store = getRoomStore();
-    const existing = (await store.get(roomId, { type: 'json' })) as RoomPayload | null;
-
-    let room = isFreshRoom(existing) ? sanitizeRoom(existing) : emptyRoom();
-
-    if (existing && !isFreshRoom(existing)) {
-      await store.delete(roomId);
-      room = emptyRoom();
-    }
 
     if (event.httpMethod === 'GET') {
-      return json(
-        200,
-        room.roomId
-          ? room
-          : {
-              ...room,
-              roomId,
-            },
+      const existing = await withRetry('getRoom', WRITE_RETRY_ATTEMPTS, () =>
+        getRoomFresh(store, roomId),
       );
+
+      let room = isFreshRoom(existing) ? sanitizeRoom(existing) : emptyRoom();
+      if (existing && !isFreshRoom(existing)) {
+        await store.delete(roomId).catch(() => {});
+      }
+
+      room = sanitizeRoom(pruneStaleParticipants(room));
+
+      return json(200, room.roomId ? room : { ...room, roomId });
     }
 
     if (event.httpMethod === 'POST') {
@@ -389,96 +536,148 @@ export const handler: Handler = async (event) => {
         );
       }
 
-      if (!room.roomId) {
-        const requestedType = sanitizeRoomType(body.type);
-        const requestedMaxPeers = sanitizeMaxPeers(body.maxPeers, requestedType);
-        room = createRoom(roomId, requestedType, requestedMaxPeers);
-      }
-
       const nickname = sanitizeNickname(body.nickname);
-      const alreadyJoined = room.peers.includes(peerId);
-      const maxPeers = sanitizeMaxPeers(room.maxPeers, room.type);
+      const passwordHash = sanitizePasswordHash(body.passwordHash);
+      const joinOnly = isJoinOnlyRequest(body);
 
-      if (!alreadyJoined && room.peers.length >= maxPeers) {
-        return errorJson(
-          409,
-          'ROOM_FULL',
-          `This room is full (${maxPeers} participants maximum).`,
-        );
-      }
+      try {
+        const result = await loadMutateSave(store, roomId, async (room) => {
+          room = sanitizeRoom(pruneStaleParticipants(room));
 
-      ensureParticipant(room, peerId, nickname);
+          if (!room.roomId) {
+            if (!joinOnly) {
+              throw new PresenceHandledError(
+                400,
+                'BAD_REQUEST',
+                'Room does not exist yet. Join/create the room before signaling.',
+              );
+            }
 
-      if (isJoinOnlyRequest(body)) {
-        room.updatedAt = Date.now();
-        room = sanitizeRoom(room);
-        await saveRoom(store, roomId, room);
-        return json(200, room);
-      }
+            const requestedType = sanitizeRoomType(body.type);
+            const requestedMaxPeers = sanitizeMaxPeers(body.maxPeers, requestedType);
 
-      if (body.offer) {
-        if (room.type === 'private' || !body.targetPeerId) {
-          room.offer = body.offer;
-        } else {
-          room.signals[peerId] ??= {};
-          room.signals[peerId][body.targetPeerId] ??= { ice: [] };
-          room.signals[peerId][body.targetPeerId].offer = body.offer;
+            if (!passwordHash) {
+              throw new PresenceHandledError(
+                400,
+                'BAD_REQUEST',
+                'passwordHash is required for room creation',
+              );
+            }
+
+            room = createRoom(roomId, requestedType, requestedMaxPeers, passwordHash);
+          } else if (joinOnly) {
+            if (!passwordHash) {
+              throw new PresenceHandledError(400, 'BAD_REQUEST', 'passwordHash is required');
+            }
+
+            if ((room.passwordHash ?? '') !== passwordHash) {
+              throw new PresenceHandledError(401, 'WRONG_PASSWORD', 'Wrong password');
+            }
+
+            room = sanitizeRoom(pruneStaleParticipants(room));
+
+            const alreadyJoined = room.peers.includes(peerId);
+            const maxPeers = sanitizeMaxPeers(room.maxPeers, room.type);
+
+            if (!alreadyJoined && room.peers.length >= maxPeers) {
+              throw new PresenceHandledError(
+                409,
+                'ROOM_FULL',
+                `This room is full. Maximum ${maxPeers} participants allowed.`,
+              );
+            }
+
+            ensureParticipant(room, peerId, nickname);
+            room = sanitizeRoom(room);
+
+            return room;
+          }
+
+          ensureParticipant(room, peerId, nickname);
+
+          if (body.offer) {
+            if (room.type === 'private' && !body.targetPeerId) {
+              room.offer = body.offer;
+            } else if (body.targetPeerId) {
+              room.signals[peerId] ??= {};
+              room.signals[peerId][body.targetPeerId] ??= { ice: [] };
+              room.signals[peerId][body.targetPeerId].offer = body.offer;
+            }
+          }
+
+          if (body.answer) {
+            if (room.type === 'private' && !body.targetPeerId) {
+              room.answer = body.answer;
+            } else if (body.targetPeerId) {
+              room.signals[peerId] ??= {};
+              room.signals[peerId][body.targetPeerId] ??= { ice: [] };
+              room.signals[peerId][body.targetPeerId].answer = body.answer;
+            }
+          }
+
+          if (body.ice?.length) {
+            if (room.type === 'private' && !body.targetPeerId) {
+              room.ice[peerId] = capIceList([...(room.ice[peerId] ?? []), ...body.ice]);
+            } else if (body.targetPeerId) {
+              room.signals[peerId] ??= {};
+              room.signals[peerId][body.targetPeerId] ??= { ice: [] };
+              room.signals[peerId][body.targetPeerId].ice = capIceList([
+                ...room.signals[peerId][body.targetPeerId].ice,
+                ...body.ice,
+              ]);
+            }
+          }
+
+          return room;
+        });
+
+        return json(200, result);
+      } catch (error) {
+        if (error instanceof PresenceHandledError) {
+          return errorJson(error.statusCode, error.code, error.message);
         }
+        throw error;
       }
-
-      if (body.answer) {
-        if (room.type === 'private' || !body.targetPeerId) {
-          room.answer = body.answer;
-        } else {
-          room.signals[peerId] ??= {};
-          room.signals[peerId][body.targetPeerId] ??= { ice: [] };
-          room.signals[peerId][body.targetPeerId].answer = body.answer;
-        }
-      }
-
-      if (body.ice?.length) {
-        if (room.type === 'private' || !body.targetPeerId) {
-          room.ice[peerId] = [...(room.ice[peerId] ?? []), ...body.ice];
-        } else {
-          room.signals[peerId] ??= {};
-          room.signals[peerId][body.targetPeerId] ??= { ice: [] };
-          room.signals[peerId][body.targetPeerId].ice.push(...body.ice);
-        }
-      }
-
-      room.updatedAt = Date.now();
-      room = sanitizeRoom(room);
-      await saveRoom(store, roomId, room);
-      return json(200, room);
     }
 
     if (event.httpMethod === 'DELETE') {
+      const existing = await withRetry('getRoom', WRITE_RETRY_ATTEMPTS, () =>
+        getRoomFresh(store, roomId),
+      );
+
+      let room = isFreshRoom(existing) ? sanitizeRoom(existing) : emptyRoom();
+      if (existing && !isFreshRoom(existing)) {
+        await store.delete(roomId).catch(() => {});
+      }
+
       if (!room.roomId) {
         return json(200, { ...emptyRoom(), roomId });
       }
 
       if (peerId) {
         removePeer(room, peerId);
+        room = sanitizeRoom(pruneStaleParticipants(room));
 
         if (room.peers.length === 0) {
-          await store.delete(roomId);
+          await store.delete(roomId).catch(() => {});
           return json(200, { ...emptyRoom(room.type, room.maxPeers), roomId });
         }
 
         room.updatedAt = Date.now();
-        room = sanitizeRoom(room);
         await saveRoom(store, roomId, room);
         return json(200, room);
       }
 
-      await store.delete(roomId);
+      await store.delete(roomId).catch(() => {});
       return json(200, { ...emptyRoom(), roomId });
     }
 
     return errorJson(405, 'METHOD_NOT_ALLOWED', 'Method not allowed');
   } catch (error) {
-    console.error('presence function error:', error);
-
+    console.error('presence function error', error);
+    if (error instanceof PresenceHandledError) {
+      return errorJson(error.statusCode, error.code, error.message);
+    }
     return errorJson(
       500,
       'PRESENCE_FAILED',

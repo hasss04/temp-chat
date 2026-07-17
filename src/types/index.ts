@@ -30,7 +30,6 @@ export type WireMessage =
   | { kind: 'rtc-ice'; candidate: string };
 
 export type ThemeMode = 'light' | 'dark' | 'system';
-
 export type ResolvedTheme = 'light' | 'dark';
 
 export type PresenceStatus = 'online' | 'away' | 'offline';
@@ -54,4 +53,24 @@ export type GroupRoomInfo = {
   isGroup: boolean;
   participants: RoomParticipant[];
   maxParticipants: number;
+};
+
+export type AppTab = 'chat';
+
+export type ConnectionStatus =
+  | 'idle'
+  | 'joining'
+  | 'waiting'
+  | 'connecting'
+  | 'connected'
+  | 'reconnecting'
+  | 'error';
+
+export type ToastTone = 'success' | 'error' | 'info';
+
+export type ToastItem = {
+  id: string;
+  tone: ToastTone;
+  title: string;
+  message: string;
 };

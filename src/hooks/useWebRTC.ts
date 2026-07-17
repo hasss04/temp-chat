@@ -23,6 +23,7 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
   const localRef = useRef<MediaStream | null>(null);
   const remoteRef = useRef<MediaStream | null>(null);
   const iceExternalRef = useRef<((candidate: RTCIceCandidate) => void) | null>(null);
+  const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
 
@@ -43,6 +44,7 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
     dataRef.current = null;
     localRef.current = null;
     remoteRef.current = remoteStream;
+    pendingIceRef.current = [];
     setStatePartial({ connected: false });
 
     pc.ondatachannel = (event) => {
@@ -75,7 +77,7 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
               candidate: JSON.stringify(event.candidate.toJSON()),
             } satisfies WireMessage),
           );
-        } catch { /* peer may have disconnected */ }
+        } catch {}
       }
 
       iceExternalRef.current?.(event.candidate);
@@ -116,13 +118,16 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
       remoteRef.current?.getTracks().forEach((track) => track.stop());
 
       pc.getSenders().forEach((sender) => {
-        try { sender.track?.stop(); } catch { /* ok */ }
+        try {
+          sender.track?.stop();
+        } catch {}
       });
 
       pc.close();
       peerRef.current = null;
       localRef.current = null;
       remoteRef.current = null;
+      pendingIceRef.current = [];
       setStatePartial({ connected: false });
 
       window.dispatchEvent(new CustomEvent('tempchat:local-stream', { detail: null }));
@@ -176,10 +181,26 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
             void addIceCandidate(JSON.parse(wire.candidate));
             break;
         }
-      } catch {
-        // ignore malformed frames
-      }
+      } catch {}
     };
+  }
+
+  async function flushPendingIce() {
+    const pc = peerRef.current;
+    if (!pc || !pc.remoteDescription) return;
+
+    const queued = pendingIceRef.current;
+    if (!queued.length) return;
+
+    pendingIceRef.current = [];
+
+    for (const candidate of queued) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (error) {
+        console.error('Failed to flush queued ICE candidate', error);
+      }
+    }
   }
 
   async function createLocalOffer() {
@@ -188,9 +209,13 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
 
     const existingChannel = dataRef.current;
     if (!existingChannel || existingChannel.readyState === 'closed') {
-      const channel = pc.createDataChannel(CHANNEL_NAME, { ordered: true, id: 0 });
+      const channel = pc.createDataChannel(CHANNEL_NAME, { ordered: true });
       dataRef.current = channel;
       bindChannel(channel);
+    }
+
+    if (pc.signalingState !== 'stable' && pc.signalingState !== 'have-local-offer') {
+      throw new Error(`Cannot create local offer while signalingState=${pc.signalingState}`);
     }
 
     const offer = await pc.createOffer();
@@ -208,7 +233,22 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
       pc.remoteDescription.sdp === offer.sdp;
 
     if (!alreadySet) {
+      if (pc.signalingState !== 'stable' && pc.signalingState !== 'have-remote-offer') {
+        throw new Error(`Cannot apply remote offer while signalingState=${pc.signalingState}`);
+      }
+
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      await flushPendingIce();
+    }
+
+    if (
+      pc.signalingState !== 'have-remote-offer' &&
+      pc.signalingState !== 'have-local-pranswer'
+    ) {
+      if (pc.localDescription?.type === 'answer') {
+        return pc.localDescription;
+      }
+      throw new Error(`Cannot create answer while signalingState=${pc.signalingState}`);
     }
 
     const answer = await pc.createAnswer();
@@ -227,13 +267,20 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
       pc.remoteDescription.sdp === answer.sdp;
 
     if (alreadySet) return;
+    if (pc.signalingState !== 'have-local-offer') return;
 
     await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    await flushPendingIce();
   }
 
   async function addIceCandidate(candidate: RTCIceCandidateInit) {
     const pc = peerRef.current;
-    if (!pc || !pc.remoteDescription) return;
+    if (!pc) return;
+
+    if (!pc.remoteDescription) {
+      pendingIceRef.current.push(candidate);
+      return;
+    }
 
     try {
       await pc.addIceCandidate(new RTCIceCandidate(candidate));
@@ -251,7 +298,10 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
         noiseSuppression: true,
         autoGainControl: true,
       },
-      video: type === 'video' ? { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } } : false,
+      video:
+        type === 'video'
+          ? { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }
+          : false,
     });
 
     localRef.current = stream;
@@ -277,6 +327,7 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
     const pc = peerRef.current;
     const channel = dataRef.current;
     if (!pc || !channel || channel.readyState !== 'open') return;
+    if (pc.signalingState !== 'stable') return;
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -294,7 +345,27 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
     const channel = dataRef.current;
     if (!pc || !channel) return;
 
-    await pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(sdpJson)));
+    const offer = JSON.parse(sdpJson) as RTCSessionDescriptionInit;
+    const alreadySet =
+      pc.remoteDescription &&
+      pc.remoteDescription.type === offer.type &&
+      pc.remoteDescription.sdp === offer.sdp;
+
+    if (!alreadySet) {
+      if (pc.signalingState !== 'stable' && pc.signalingState !== 'have-remote-offer') {
+        return;
+      }
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      await flushPendingIce();
+    }
+
+    if (
+      pc.signalingState !== 'have-remote-offer' &&
+      pc.signalingState !== 'have-local-pranswer'
+    ) {
+      return;
+    }
+
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
 
@@ -311,8 +382,18 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
   async function handleRemoteRenegotiationAnswer(sdpJson: string) {
     const pc = peerRef.current;
     if (!pc || pc.signalingState === 'stable') return;
+    if (pc.signalingState !== 'have-local-offer') return;
 
-    await pc.setRemoteDescription(new RTCSessionDescription(JSON.parse(sdpJson)));
+    const answer = JSON.parse(sdpJson) as RTCSessionDescriptionInit;
+    const alreadySet =
+      pc.remoteDescription &&
+      pc.remoteDescription.type === answer.type &&
+      pc.remoteDescription.sdp === answer.sdp;
+
+    if (alreadySet) return;
+
+    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    await flushPendingIce();
   }
 
   function endCall() {
@@ -323,7 +404,9 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
     if (pc) {
       pc.getSenders().forEach((sender) => {
         if (sender.track) {
-          try { pc.removeTrack(sender); } catch { /* ok */ }
+          try {
+            pc.removeTrack(sender);
+          } catch {}
         }
       });
     }
@@ -448,6 +531,7 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
     peerRef.current = null;
     localRef.current = null;
     remoteRef.current = null;
+    pendingIceRef.current = [];
 
     setStatePartial({ connected: false });
     window.dispatchEvent(new CustomEvent('tempchat:local-stream', { detail: null }));

@@ -1,16 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Trash2, Phone, Video, WifiOff, Users, LogOut } from 'lucide-react';
 import {
   SignalError,
   deriveRole,
   getRoom,
-  joinRoom,
   leaveRoom,
   postAnswer,
   postIce,
   postOffer,
 } from '../lib/signaling';
-import { initRealtime, subscribeRoomEvents, closeRealtimeClient } from '../lib/realtime';
 import { clearPersistedSession, persistMessages, persistSession, wipeRoom } from '../lib/storage';
 import { useAppStore } from '../store/useAppStore';
 import { useWebRTC } from '../hooks/useWebRTC';
@@ -23,6 +21,8 @@ import type { CallPhase, CallQuality, CallType } from '../types';
 
 type DerivedRole = 'waiting' | 'offerer' | 'answerer';
 type ActiveRole = 'offerer' | 'answerer';
+
+const FAST_POLL_MS = 1500;
 
 function initialsOf(name: string) {
   return (name || 'A').trim().slice(0, 2).toUpperCase();
@@ -50,7 +50,7 @@ export function SignalBridge() {
   const setGroupInfo = useAppStore((s) => s.setGroupInfo);
   const setParticipants = useAppStore((s) => s.setParticipants);
   const participants = useAppStore((s) => s.participants);
-  const storedPeerId = useAppStore((s) => s.peerId);
+  const peerId = useAppStore((s) => s.peerId);
 
   const [role, setRole] = useState<ActiveRole | null>(null);
   const [restartKey, setRestartKey] = useState(0);
@@ -67,19 +67,20 @@ export function SignalBridge() {
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
 
-  const peerId = useMemo(() => storedPeerId || crypto.randomUUID(), [storedPeerId]);
+  const connectedRef = useRef(connected);
+  connectedRef.current = connected;
+
   const appliedIce = useRef<Record<string, number>>({});
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const answerAppliedRef = useRef(false);
+  const answeredOfferSdpRef = useRef<string | null>(null);
   const typingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const peerTypingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const localTypingSentRef = useRef(false);
   const draftPersistTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isCallInitiatorRef = useRef(false);
-  const joinedRef = useRef(false);
   const pendingIceRef = useRef<RTCIceCandidateInit[]>([]);
-  const offSignalRef = useRef<(() => void) | null>(null);
-  const groupUnsubRef = useRef<(() => void) | null>(null);
+  const groupPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const groupInfoRef = useRef(groupInfo);
   groupInfoRef.current = groupInfo;
 
@@ -172,18 +173,19 @@ export function SignalBridge() {
   }, []);
 
   useVisibilityReconnect(
-    () => rtcApi.getConnectionState(),
+    () => rtcApiRef.current.getConnectionState(),
     () => {
+      if (!roomId || !secret || !peerId) return;
       if (connectionStatus === 'reconnecting' || connectionStatus === 'joining') return;
-      setStatePartial({ connectionStatus: 'reconnecting' });
+      setStatePartial({ connectionStatus: 'reconnecting', connected: false });
       pushToast({
         tone: 'info',
         title: 'Reconnecting',
         message: 'Trying to restore the connection.',
       });
       answerAppliedRef.current = false;
+      answeredOfferSdpRef.current = null;
       appliedIce.current = {};
-      joinedRef.current = false;
       pendingIceRef.current = [];
       setRestartKey((k) => k + 1);
     },
@@ -229,12 +231,18 @@ export function SignalBridge() {
   }, [draft, roomId, secret, peerId, nickname, activeTab, themeMode]);
 
   useEffect(() => {
+    if (!roomId || !secret || !peerId) return;
+
     let myRole: DerivedRole = 'waiting';
     let cancelled = false;
-    joinedRef.current = false;
+
     pendingIceRef.current = [];
     answerAppliedRef.current = false;
+    answeredOfferSdpRef.current = null;
     appliedIce.current = {};
+    setRole(null);
+    setLocalStream(null);
+    setRemoteStream(null);
 
     const onLocal = (e: Event) => {
       const stream = (e as CustomEvent<MediaStream | null>).detail;
@@ -249,63 +257,111 @@ export function SignalBridge() {
     window.addEventListener('tempchat:local-stream', onLocal as EventListener);
     window.addEventListener('tempchat:remote-stream', onRemote as EventListener);
 
-    const offIce = rtcApi.onIceCandidate((candidate) => {
+    const offIce = rtcApiRef.current.onIceCandidate((candidate) => {
       const init = candidate.toJSON();
-      if (joinedRef.current) {
-        postIce(roomId, peerId, init).catch(() => {});
-      } else {
+      postIce(roomId, peerId, init).catch(() => {
         pendingIceRef.current.push(init);
-      }
+      });
     });
 
-    function flushPendingIce() {
-      const queued = pendingIceRef.current;
+    async function flushPendingIce() {
+      if (!pendingIceRef.current.length) return;
+      const queued = [...pendingIceRef.current];
       pendingIceRef.current = [];
       for (const init of queued) {
-        postIce(roomId, peerId, init).catch(() => {});
+        try {
+          await postIce(roomId, peerId, init);
+        } catch {
+          pendingIceRef.current.push(init);
+        }
       }
+    }
+
+    function reportTransientError(error: unknown) {
+      if (cancelled) return;
+      console.error('[signal-sync] failed', error);
+      pushToast({
+        tone: 'error',
+        title: 'Sync issue',
+        message:
+          error instanceof Error
+            ? error.message
+            : 'Could not reach the signaling server. Retrying…',
+      });
+    }
+
+    async function maybeAnswerRoomOffer(room: Awaited<ReturnType<typeof getRoom>>) {
+      if (myRole !== 'answerer' || !room.offer) return;
+
+      const parsedOffer = JSON.parse(room.offer) as RTCSessionDescriptionInit;
+      const offerSdp = parsedOffer.sdp ?? null;
+
+      if (offerSdp && answeredOfferSdpRef.current === offerSdp) {
+        answerAppliedRef.current = true;
+        return;
+      }
+
+      const answer = await rtcApiRef.current.acceptRemoteOffer(parsedOffer);
+      await postAnswer(roomId, peerId, answer);
+
+      answeredOfferSdpRef.current = offerSdp;
+      answerAppliedRef.current = true;
     }
 
     async function syncOnce() {
       if (groupInfoRef.current?.isGroup || cancelled) return;
-      if (rtcApi.getConnectionState() === 'connected') return;
+      if (rtcApiRef.current.getConnectionState() === 'connected') return;
 
       try {
         const room = await getRoom(roomId);
+        await flushPendingIce();
 
-        if (myRole === 'answerer' && !answerAppliedRef.current && room.offer) {
-          const answer = await rtcApi.acceptRemoteOffer(JSON.parse(room.offer));
-          await postAnswer(roomId, peerId, answer);
-          answerAppliedRef.current = true;
+        const updatedParticipants =
+          room.participants?.map((p) => ({
+            peerId: p.peerId,
+            nickname: p.nickname || 'Anon',
+            status: 'online' as const,
+            joinedAt: p.joinedAt,
+          })) ?? [];
+        setParticipants(updatedParticipants);
+
+        if (myRole === 'answerer' && room.offer) {
+          await maybeAnswerRoomOffer(room);
         }
 
-        if (myRole === 'offerer' && room.answer && !connected) {
-          await rtcApi.acceptRemoteAnswer(JSON.parse(room.answer));
+        if (myRole === 'offerer' && room.answer && !connectedRef.current) {
+          await rtcApiRef.current.acceptRemoteAnswer(JSON.parse(room.answer));
         }
 
         for (const [otherId, candidates] of Object.entries(room.ice ?? {})) {
           if (otherId === peerId) continue;
           const applied = appliedIce.current[otherId] ?? 0;
           for (let i = applied; i < candidates.length; i++) {
-            await rtcApi.addIceCandidate(JSON.parse(candidates[i]));
+            await rtcApiRef.current.addIceCandidate(JSON.parse(candidates[i]));
           }
           appliedIce.current[otherId] = candidates.length;
         }
       } catch (error) {
         if (error instanceof SignalError && error.code === 'ROOM_FULL') {
           if (!cancelled) {
-            setStatePartial({ connectionStatus: 'error', roomFull: true });
+            setStatePartial({ connectionStatus: 'error', roomFull: true, connected: false });
+          }
+          return;
+        }
+        if (error instanceof SignalError && error.code === 'WRONG_PASSWORD') {
+          if (!cancelled) {
+            setStatePartial({ connectionStatus: 'error', connected: false });
             pushToast({
               tone: 'error',
-              title: 'Room full',
-              message: 'This room is currently occupied. Please wait until one participant leaves.',
+              title: 'Wrong password',
+              message: 'The password for this room is incorrect.',
             });
           }
           return;
         }
-
-        if (!cancelled && rtcApi.getConnectionState() !== 'connected') {
-          setStatePartial({ connectionStatus: 'error' });
+        if (!cancelled && rtcApiRef.current.getConnectionState() !== 'connected') {
+          setStatePartial({ connectionStatus: 'error', connected: false });
+          reportTransientError(error);
         }
       }
     }
@@ -315,18 +371,11 @@ export function SignalBridge() {
         setStatePartial({
           connectionStatus: restartKey > 0 ? 'reconnecting' : 'joining',
           roomFull: false,
+          connected: false,
           peerId,
         });
 
-        initRealtime(peerId);
-
-        if (restartKey > 0) {
-          await leaveRoom(roomId, peerId).catch(() => {});
-        }
-
-        const joinedRoom = await joinRoom(roomId, peerId, nickname);
-        joinedRef.current = true;
-        flushPendingIce();
+        const joinedRoom = await getRoom(roomId);
 
         const roomType = joinedRoom.type ?? 'private';
         const roomParticipants =
@@ -336,7 +385,6 @@ export function SignalBridge() {
             status: 'online' as const,
             joinedAt: p.joinedAt,
           })) ?? [];
-
         setParticipants(roomParticipants);
 
         if (roomType === 'group') {
@@ -344,11 +392,12 @@ export function SignalBridge() {
             roomId,
             isGroup: true,
             participants: roomParticipants,
-            maxParticipants: joinedRoom.maxPeers ?? 12,
+            maxParticipants: joinedRoom.maxPeers ?? 10,
           });
           setStatePartial({ connectionStatus: 'connected', connected: true });
 
-          const unsubGroup = subscribeRoomEvents(roomId, async () => {
+          async function pollGroup() {
+            if (cancelled) return;
             try {
               const room = await getRoom(roomId);
               const updated =
@@ -363,83 +412,70 @@ export function SignalBridge() {
                 roomId,
                 isGroup: true,
                 participants: updated,
-                maxParticipants: room.maxPeers ?? 12,
+                maxParticipants: room.maxPeers ?? 10,
               });
-            } catch {
-              // ignore transient issues
+            } catch (error) {
+              reportTransientError(error);
             }
-          });
+          }
 
-          groupUnsubRef.current = unsubGroup;
+          groupPollRef.current = setInterval(() => void pollGroup(), FAST_POLL_MS * 2);
           return;
         }
 
         setGroupInfo(null);
-
-        const roleStartedRef = { current: false }; // local to this effect run
-        let myRole: DerivedRole = 'waiting';
+        const roleStartedRef = { current: false };
+        myRole = 'waiting';
 
         async function tryResolveRoleAndStart(seedRoom?: typeof joinedRoom) {
           if (cancelled || roleStartedRef.current) return;
           try {
             const room = seedRoom ?? (await getRoom(roomId));
             const derived = deriveRole(room, peerId);
+
             if (derived === 'waiting') {
-              setStatePartial({ connectionStatus: 'waiting' });
-              return; // still alone — listener/poll will retry us later
+              setStatePartial({ connectionStatus: 'waiting', connected: false });
+              return;
             }
+
             roleStartedRef.current = true;
             myRole = derived;
             setRole(derived);
+
             if (derived === 'offerer') {
-              setStatePartial({ connectionStatus: 'waiting' });
-              const offer = await rtcApi.createLocalOffer();
+              setStatePartial({ connectionStatus: 'waiting', connected: false });
+              const offer = await rtcApiRef.current.createLocalOffer();
               await postOffer(roomId, peerId, offer);
             } else {
-              setStatePartial({ connectionStatus: 'connecting' });
+              setStatePartial({ connectionStatus: 'connecting', connected: false });
               if (room.offer) {
-                const answer = await rtcApi.acceptRemoteOffer(JSON.parse(room.offer));
-                await postAnswer(roomId, peerId, answer);
-                answerAppliedRef.current = true;
+                await maybeAnswerRoomOffer(room);
               }
             }
           } catch (error) {
-            if (error instanceof SignalError && error.code === 'ROOM_FULL') {
+            if (error instanceof SignalError && error.code === 'WRONG_PASSWORD') {
               if (!cancelled) {
-                setStatePartial({ connectionStatus: 'error', roomFull: true });
+                setStatePartial({ connectionStatus: 'error', connected: false });
                 pushToast({
                   tone: 'error',
-                  title: 'Room full',
-                  message: 'This room is currently occupied. Please wait until one participant leaves.',
+                  title: 'Wrong password',
+                  message: 'The password for this room is incorrect.',
                 });
               }
               return;
             }
-            if (!cancelled && rtcApi.getConnectionState() !== 'connected') {
-              setStatePartial({ connectionStatus: 'error' });
+            if (!cancelled && rtcApiRef.current.getConnectionState() !== 'connected') {
+              setStatePartial({ connectionStatus: 'error', connected: false });
+              reportTransientError(error);
             }
           }
         }
 
-        // Event-driven: whenever anything changes in the room (peer joins,
-        // offer/answer/ICE posted), re-check role (if unresolved) and resync.
-        const unsubSignal = subscribeRoomEvents(roomId, () => {
-          void tryResolveRoleAndStart();
-          void syncOnce();
-        });
-        offSignalRef.current = unsubSignal;
-
-        // Fast path: try immediately using the snapshot we already have from
-        // joinRoom(), so a peer who arrives second connects instantly.
         await tryResolveRoleAndStart(joinedRoom);
         void syncOnce();
 
-        // Unbounded safety-net: keeps retrying role resolution + sync every
-        // 4s for as long as the room stays open, instead of giving up after
-        // a fixed window. This is what lets a peer who's genuinely first
-        // just wait indefinitely for the second peer to show up.
         pollRef.current = setInterval(() => {
-          if (rtcApi.getConnectionState() === 'connected') {
+          if (rtcApiRef.current.getConnectionState() === 'connected') {
             if (pollRef.current) {
               clearInterval(pollRef.current);
               pollRef.current = null;
@@ -448,36 +484,14 @@ export function SignalBridge() {
           }
           void tryResolveRoleAndStart();
           void syncOnce();
-        }, 4000);
+        }, FAST_POLL_MS);
       } catch (error) {
         if (cancelled) return;
-
-        setStatePartial({ connectionStatus: 'error' });
-
-        if (error instanceof SignalError && error.code === 'ROOM_FULL') {
-          await clearPersistedSession(roomId).catch(() => {});
-          setStatePartial({
-            roomId: '',
-            nickname: '',
-            secret: '',
-            connected: false,
-            connectionStatus: 'idle',
-            activeTab: 'chat',
-            groupInfo: null,
-            participants: [],
-          });
-          pushToast({
-            tone: 'error',
-            title: 'Room full',
-            message: 'This room is currently occupied. Please try another session.',
-          });
-          return;
-        }
-
+        setStatePartial({ connectionStatus: 'error', connected: false });
         pushToast({
           tone: 'error',
           title: 'Connection failed',
-          message: 'Could not join the room. Please retry.',
+          message: error instanceof Error ? error.message : 'Could not open the room.',
         });
       }
     })();
@@ -485,41 +499,36 @@ export function SignalBridge() {
     return () => {
       cancelled = true;
       offIce();
-      offSignalRef.current?.();
-      offSignalRef.current = null;
-      groupUnsubRef.current?.();
-      groupUnsubRef.current = null;
 
       if (pollRef.current) {
         clearInterval(pollRef.current);
         pollRef.current = null;
       }
-
+      if (groupPollRef.current) {
+        clearInterval(groupPollRef.current);
+        groupPollRef.current = null;
+      }
       if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
       if (peerTypingTimeoutRef.current) clearTimeout(peerTypingTimeoutRef.current);
 
       window.removeEventListener('tempchat:local-stream', onLocal as EventListener);
       window.removeEventListener('tempchat:remote-stream', onRemote as EventListener);
-
-      joinedRef.current = false;
-      pendingIceRef.current = [];
-      leaveRoom(roomId, peerId).catch(() => {});
     };
   }, [
-    connected,
     peerId,
     pushToast,
     roomId,
     restartKey,
     setStatePartial,
-    nickname,
-    rtcApi,
     setGroupInfo,
     setParticipants,
+    secret,
   ]);
 
   useEffect(() => {
-    if (connected) setStatePartial({ connectionStatus: 'connected' });
+    if (connected) {
+      setStatePartial({ connectionStatus: 'connected' });
+    }
   }, [connected, setStatePartial]);
 
   useEffect(() => {
@@ -528,7 +537,7 @@ export function SignalBridge() {
       messages
         .filter((msg) => msg.sender === 'peer' && !msg.seenAt)
         .forEach((msg) => {
-          rtcApi.send({
+          rtcApiRef.current.send({
             kind: 'receipt',
             messageId: msg.id,
             receipt: 'seen',
@@ -545,38 +554,36 @@ export function SignalBridge() {
       document.removeEventListener('visibilitychange', markVisibleMessagesSeen);
       window.removeEventListener('focus', markVisibleMessagesSeen);
     };
-  }, [messages, connected, activeTab, rtcApi]);
+  }, [messages, connected, activeTab]);
 
   useEffect(() => {
     if (callPhase !== 'active') return;
     const id = window.setInterval(async () => {
-      setCallQuality(await rtcApi.getCallQuality());
+      setCallQuality(await rtcApiRef.current.getCallQuality());
     }, 3000);
     return () => window.clearInterval(id);
-  }, [callPhase, rtcApi]);
+  }, [callPhase]);
 
   function stopTypingSignal() {
     if (!localTypingSentRef.current) return;
     localTypingSentRef.current = false;
-    rtcApi.send({ kind: 'typing', isTyping: false });
+    rtcApiRef.current.send({ kind: 'typing', isTyping: false });
   }
 
   function handleDraftChange(value: string) {
     setDraft(value);
     if (groupInfo?.isGroup) return;
-    if (!connected || !rtcApi.isDataChannelOpen()) return;
+    if (!connected || !rtcApiRef.current.isDataChannelOpen()) return;
 
     if (value.trim() && !localTypingSentRef.current) {
       localTypingSentRef.current = true;
-      rtcApi.send({ kind: 'typing', isTyping: true });
+      rtcApiRef.current.send({ kind: 'typing', isTyping: true });
     }
-
     if (!value.trim()) {
       if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
       stopTypingSignal();
       return;
     }
-
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
     typingTimeoutRef.current = setTimeout(() => stopTypingSignal(), 1500);
   }
@@ -584,15 +591,19 @@ export function SignalBridge() {
   function sendMessage() {
     const text = draft.trim();
     if (!text) return;
-
     const id = crypto.randomUUID();
     const createdAt = Date.now();
-
     addMessage({ id, sender: 'me', text, createdAt });
 
     if (!groupInfo?.isGroup) {
       if (!connected) return;
-      rtcApi.send({ kind: 'chat', id, text, senderName: nickname || 'Anon', createdAt });
+      rtcApiRef.current.send({
+        kind: 'chat',
+        id,
+        text,
+        senderName: nickname || 'Anon',
+        createdAt,
+      });
       if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
       stopTypingSignal();
     }
@@ -609,23 +620,19 @@ export function SignalBridge() {
       });
       return;
     }
-
     if (!connected || callPhase !== 'idle') return;
-
     isCallInitiatorRef.current = true;
     setCallType(type);
     setCallPhase('outgoing');
-    rtcApi.send({ kind: 'call-invite', callType: type });
+    rtcApiRef.current.send({ kind: 'call-invite', callType: type });
   }
 
   async function acceptCall() {
     if (!callType) return;
-
     setCallPhase('connecting');
-
     try {
-      await rtcApi.acquireCallMedia(callType);
-      rtcApi.send({ kind: 'call-accept', callType });
+      await rtcApiRef.current.acquireCallMedia(callType);
+      rtcApiRef.current.send({ kind: 'call-accept', callType });
       setCallPhase('active');
     } catch {
       pushToast({
@@ -633,46 +640,47 @@ export function SignalBridge() {
         title: 'Permission denied',
         message: 'Allow microphone and camera access to accept the call.',
       });
-      rtcApi.send({ kind: 'call-reject' });
+      rtcApiRef.current.send({ kind: 'call-reject' });
       resetCallState();
     }
   }
 
   function rejectCall() {
-    rtcApi.send({ kind: 'call-reject' });
+    rtcApiRef.current.send({ kind: 'call-reject' });
     resetCallState();
   }
 
   function endCall() {
-    rtcApi.send({ kind: 'call-end' });
+    rtcApiRef.current.send({ kind: 'call-end' });
     resetCallState();
   }
 
   function toggleMic() {
     const next = !micOn;
     setMicOn(next);
-    rtcApi.toggleAudio(next);
+    rtcApiRef.current.toggleAudio(next);
   }
 
   function toggleCam() {
     const next = !camOn;
     setCamOn(next);
-    rtcApi.toggleVideo(next);
+    rtcApiRef.current.toggleVideo(next);
   }
 
   function toggleHold() {
     const next = !onHold;
     setOnHold(next);
-    rtcApi.toggleAudio(!next && micOn);
-    rtcApi.send({ kind: 'call-hold', onHold: next });
+    rtcApiRef.current.toggleAudio(!next && micOn);
+    rtcApiRef.current.send({ kind: 'call-hold', onHold: next });
   }
 
   async function killSwitch() {
-    rtcApi.destroy();
+    rtcApiRef.current.destroy();
     await wipeRoom(roomId).catch(() => {});
     await clearPersistedSession(roomId).catch(() => {});
-    await leaveRoom(roomId, peerId).catch(() => {});
-    closeRealtimeClient();
+    if (peerId) {
+      await leaveRoom(roomId, peerId).catch(() => {});
+    }
     reset();
     pushToast({
       tone: 'success',
@@ -682,12 +690,14 @@ export function SignalBridge() {
   }
 
   async function leaveRoomOnly() {
-    rtcApi.destroy();
+    rtcApiRef.current.destroy();
     await clearPersistedSession(roomId).catch(() => {});
-    await leaveRoom(roomId, peerId).catch(() => {});
-    closeRealtimeClient();
+    if (peerId) {
+      await leaveRoom(roomId, peerId).catch(() => {});
+    }
     setStatePartial({
       roomId: '',
+      peerId: '',
       nickname: '',
       secret: '',
       connected: false,
@@ -729,20 +739,17 @@ export function SignalBridge() {
           <span>You&apos;re offline. Messages will send once your connection returns.</span>
         </div>
       )}
-
       {isOnline && connectionStatus === 'reconnecting' && (
         <div className="banner banner-reconnect" role="status">
           <span className="banner-dot" />
           <span>Reconnecting to your peer&hellip;</span>
         </div>
       )}
-
       <header className="room-header">
         <div className="room-header-main">
           <div className="room-avatar">
             {groupInfo?.isGroup ? <Users size={16} /> : initialsOf('Peer')}
           </div>
-
           <div className="room-meta">
             <div className="room-meta-top">
               <p className="room-peer-name">{groupInfo?.isGroup ? 'Group room' : 'Private room'}</p>
@@ -760,7 +767,6 @@ export function SignalBridge() {
                 {statusLabel[connectionStatus]}
               </span>
             </div>
-
             <p className="room-subline">
               <span className="room-id-label">{roomId}</span>
               <span className="room-sep">&middot;</span>
@@ -768,10 +774,8 @@ export function SignalBridge() {
             </p>
           </div>
         </div>
-
         <div className="room-header-actions">
           <ThemeToggle />
-
           <button
             type="button"
             className="icon-action-btn"
@@ -782,7 +786,6 @@ export function SignalBridge() {
           >
             <Phone size={16} />
           </button>
-
           <button
             type="button"
             className="icon-action-btn"
@@ -793,7 +796,6 @@ export function SignalBridge() {
           >
             <Video size={16} />
           </button>
-
           <button
             type="button"
             className="icon-action-btn"
@@ -803,11 +805,10 @@ export function SignalBridge() {
           >
             <LogOut size={16} />
           </button>
-
           <button
             type="button"
             className="icon-danger-btn"
-            onClick={killSwitch}
+            onClick={() => void killSwitch()}
             title="Wipe room and leave"
             aria-label="Wipe room and leave"
           >
@@ -828,7 +829,6 @@ export function SignalBridge() {
               </span>
             </div>
           </div>
-
           <ChatView
             messages={messages}
             connected={connected || !!groupInfo?.isGroup}
@@ -876,7 +876,7 @@ export function SignalBridge() {
           onToggleMic={toggleMic}
           onToggleCam={toggleCam}
           onToggleBlur={() => setBlurOn((v) => !v)}
-          onSwitchCamera={() => rtcApi.switchCamera()}
+          onSwitchCamera={() => rtcApiRef.current.switchCamera()}
         />
       )}
     </div>
