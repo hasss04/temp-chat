@@ -314,6 +314,10 @@ export function SignalBridge() {
 
       try {
         const room = await getRoom(roomId);
+
+        // TEMPORARY DEBUG LOG — remove after diagnosing connection issue
+        console.log('[debug] room', roomId, JSON.stringify(room));
+
         await flushPendingIce();
 
         const updatedParticipants =
