@@ -48,7 +48,7 @@ export const handler: Handler = async (event) => {
     const client = new Ably.Rest(apiKey);
 
     const capability = JSON.stringify({
-      'tempchat-room-*': ['publish', 'subscribe', 'presence'],
+      'tempchat:*': ['publish', 'subscribe', 'presence'],
     });
 
     const tokenRequest = await client.auth.createTokenRequest({

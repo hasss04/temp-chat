@@ -6,12 +6,12 @@ import { persistSession, restoreMessages } from '../lib/storage';
 import { useAppStore } from '../store/useAppStore';
 import { ThemeToggle } from './ThemeToggle';
 import { SessionsList } from './SessionsList';
+import type { PlainMessage } from '../types';
 
 export function SetupPanel() {
   const setStatePartial = useAppStore((s) => s.setStatePartial);
   const pushToast = useAppStore((s) => s.pushToast);
   const themeMode = useAppStore((s) => s.themeMode);
-
   const [nickname, setNickname] = useState('');
   const [roomIdInput, setRoomIdInput] = useState('');
   const [secret, setSecret] = useState('');
@@ -35,7 +35,6 @@ export function SetupPanel() {
       });
       return;
     }
-
     if (!trimmedSecret) {
       pushToast({
         tone: 'error',
@@ -46,10 +45,23 @@ export function SetupPanel() {
     }
 
     setLoading(true);
-
     try {
       const peerId = existingPeerId ?? crypto.randomUUID();
-      const messages = await restoreMessages(trimmedRoom, trimmedSecret).catch(() => []);
+
+      let messages: PlainMessage[] = [];
+      try {
+        messages = await restoreMessages(trimmedRoom, trimmedSecret);
+      } catch {
+        // Local encrypted history exists for this room, but this passphrase
+        // couldn't decrypt it — this is the "wrong password" case.
+        pushToast({
+          tone: 'error',
+          title: 'Incorrect passphrase',
+          message: 'This passphrase does not match the one previously used for this room on this device.',
+        });
+        setLoading(false);
+        return;
+      }
 
       setStatePartial({
         roomId: trimmedRoom,
@@ -71,7 +83,6 @@ export function SetupPanel() {
               }
             : null,
       });
-
       await persistSession({
         roomId: trimmedRoom,
         peerId,
@@ -113,16 +124,13 @@ export function SetupPanel() {
 
     setRoomIdInput(roomId);
     setLoading(true);
-
     const peerId = crypto.randomUUID();
-
     try {
       await createRoom(roomId, peerId, {
         type: 'group',
         nickname: trimmedName,
         maxPeers: 12,
       });
-
       await enterRoom(roomId, 'group', peerId);
     } catch (error) {
       setLoading(false);
@@ -144,7 +152,6 @@ export function SetupPanel() {
       <div className="setup-topbar">
         <ThemeToggle />
       </div>
-
       <div className="setup-card">
         <div className="setup-brand">
           <div className="setup-brand-icon">
@@ -153,7 +160,6 @@ export function SetupPanel() {
           <h1>TempChat</h1>
           <p>End-to-end encrypted peer-to-peer messaging. Nothing is stored on a server.</p>
         </div>
-
         <form className="setup-form" onSubmit={handleJoin}>
           <label className="setup-field">
             <span>Display name</span>
@@ -167,7 +173,6 @@ export function SetupPanel() {
               disabled={loading}
             />
           </label>
-
           <label className="setup-field">
             <span>Room ID</span>
             <div className="setup-room-row">
@@ -191,7 +196,6 @@ export function SetupPanel() {
               </button>
             </div>
           </label>
-
           <label className="setup-field">
             <span>Passphrase</span>
             <div className="setup-password-row">
@@ -216,17 +220,14 @@ export function SetupPanel() {
               </button>
             </div>
           </label>
-
           <button type="submit" className="setup-primary-btn" disabled={loading}>
             {loading ? 'Joining…' : 'Join room'}
             <ArrowRight size={16} />
           </button>
         </form>
-
         <div className="setup-divider">
           <span>or</span>
         </div>
-
         <button
           type="button"
           className="setup-secondary-btn"
@@ -235,7 +236,6 @@ export function SetupPanel() {
         >
           {loading ? 'Creating…' : 'Create a new room'}
         </button>
-
         <SessionsList />
       </div>
     </div>

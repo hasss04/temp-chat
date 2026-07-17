@@ -34,6 +34,11 @@ export async function persistMessages(roomId: string, secret: string, messages: 
   await saveRoomCipher(roomId, cipher);
 }
 
+/**
+ * Throws if local encrypted history exists for this room but the given
+ * passphrase cannot decrypt it (wrong passphrase). Returns [] only when
+ * there is genuinely no local history yet — that is not an error.
+ */
 export async function restoreMessages(roomId: string, secret: string): Promise<PlainMessage[]> {
   if (!isValidRoomKey(roomId) || !secret?.trim()) return [];
   const blob = await loadRoomCipher(roomId);
@@ -70,18 +75,14 @@ export async function persistSession(session: PersistedSession) {
 export async function restoreActiveSession(): Promise<PersistedSession | undefined> {
   try {
     const roomId = await loadActiveRoomPointer();
-
     if (!isValidRoomKey(roomId)) {
       await clearActiveRoomPointer().catch(() => {});
       return undefined;
     }
-
     const session = await getSessionEntry(roomId.trim());
-
     if (!session || !isValidRoomKey(session.roomId) || !session.secret?.trim()) {
       return undefined;
     }
-
     return {
       ...session,
       roomId: session.roomId.trim(),
