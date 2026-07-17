@@ -1,4 +1,3 @@
-// src/components/SessionsList.tsx
 import { useEffect, useState } from 'react';
 import { Trash2 } from 'lucide-react';
 import { listSessions, restoreMessages, forgetSession, type PersistedSession } from '../lib/storage';
