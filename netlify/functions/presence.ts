@@ -16,6 +16,21 @@ type PeerSignalState = {
   ice: string[];
 };
 
+/**
+ * Group rooms have no real 1:1 WebRTC connection between every pair of
+ * participants (that would require a full mesh of RTCPeerConnections,
+ * which isn't implemented). Text chat for group rooms is relayed through
+ * this presence store instead: each sender POSTs their message here, and
+ * every participant picks up new ones on their regular group poll.
+ */
+type ChatMessage = {
+  id: string;
+  senderId: string;
+  senderName: string;
+  text: string;
+  createdAt: number;
+};
+
 type RoomPayload = {
   roomId: string;
   peers: string[];
@@ -29,6 +44,7 @@ type RoomPayload = {
   maxPeers: number;
   signals: Record<string, Record<string, PeerSignalState>>;
   passwordHash?: string;
+  messages: ChatMessage[];
 };
 
 type PresenceErrorCode =
@@ -48,6 +64,9 @@ type PresenceBody = {
   nickname?: string;
   targetPeerId?: string;
   passwordHash?: string;
+  chatMessage?: { id: string; text: string; senderName?: string; createdAt: number };
+  /** Highest message index this client already has, so the response can omit older ones. */
+  afterMessageId?: string;
 };
 
 const EXPIRY_MS = 1000 * 60 * 30;
@@ -56,6 +75,8 @@ const DEFAULT_PRIVATE_MAX_PEERS = 2;
 const DEFAULT_GROUP_MAX_PEERS = 10;
 const MAX_GROUP_PEERS = 10;
 const MAX_ICE_CANDIDATES_PER_PEER = 60;
+const MAX_GROUP_MESSAGES = 500;
+const MAX_MESSAGE_TEXT_LENGTH = 4000;
 const WRITE_RETRY_ATTEMPTS = 4;
 const WRITE_RETRY_BASE_DELAY_MS = 60;
 
@@ -203,6 +224,7 @@ function emptyRoom(type: RoomType = 'private', maxPeers?: number): RoomPayload {
     maxPeers: resolvedMaxPeers,
     signals: {},
     passwordHash: undefined,
+    messages: [],
   };
 }
 
@@ -216,6 +238,7 @@ function createRoom(
     ...emptyRoom(type, maxPeers),
     roomId,
     passwordHash,
+    messages: [],
   };
 }
 
@@ -264,6 +287,38 @@ function pruneStaleParticipants(room: RoomPayload) {
   }
 
   return room;
+}
+
+function sanitizeChatMessages(messages: unknown): ChatMessage[] {
+  if (!Array.isArray(messages)) return [];
+
+  const seen = new Set<string>();
+  const clean: ChatMessage[] = [];
+
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') continue;
+    const candidate = m as Partial<ChatMessage>;
+    if (typeof candidate.id !== 'string' || !candidate.id) continue;
+    if (seen.has(candidate.id)) continue;
+    if (typeof candidate.senderId !== 'string' || !candidate.senderId) continue;
+    if (typeof candidate.text !== 'string' || !candidate.text.trim()) continue;
+    if (typeof candidate.createdAt !== 'number') continue;
+
+    seen.add(candidate.id);
+    clean.push({
+      id: candidate.id,
+      senderId: candidate.senderId,
+      senderName: sanitizeNickname(candidate.senderName) ?? 'Anon',
+      text: candidate.text.slice(0, MAX_MESSAGE_TEXT_LENGTH),
+      createdAt: candidate.createdAt,
+    });
+  }
+
+  clean.sort((a, b) => a.createdAt - b.createdAt);
+  if (clean.length > MAX_GROUP_MESSAGES) {
+    return clean.slice(clean.length - MAX_GROUP_MESSAGES);
+  }
+  return clean;
 }
 
 function sanitizeRoom(room: RoomPayload): RoomPayload {
@@ -333,6 +388,7 @@ function sanitizeRoom(room: RoomPayload): RoomPayload {
     maxPeers,
     signals,
     passwordHash: sanitizePasswordHash(room.passwordHash),
+    messages: type === 'group' ? sanitizeChatMessages(room.messages) : [],
   };
 }
 
@@ -397,11 +453,31 @@ function parseBody(rawBody: string | null): PresenceBody {
     next.passwordHash = body.passwordHash;
   }
 
+  if (body.chatMessage !== undefined) {
+    const cm = body.chatMessage;
+    if (!cm || typeof cm !== 'object') throw new Error('chatMessage must be an object');
+    const c = cm as Record<string, unknown>;
+    if (typeof c.id !== 'string' || !c.id) throw new Error('chatMessage.id is required');
+    if (typeof c.text !== 'string' || !c.text.trim()) throw new Error('chatMessage.text is required');
+    if (typeof c.createdAt !== 'number') throw new Error('chatMessage.createdAt must be a number');
+    next.chatMessage = {
+      id: c.id,
+      text: c.text,
+      senderName: typeof c.senderName === 'string' ? c.senderName : undefined,
+      createdAt: c.createdAt,
+    };
+  }
+
   return next;
 }
 
 function isJoinOnlyRequest(body: PresenceBody) {
-  return body.offer === undefined && body.answer === undefined && body.ice === undefined;
+  return (
+    body.offer === undefined &&
+    body.answer === undefined &&
+    body.ice === undefined &&
+    body.chatMessage === undefined
+  );
 }
 
 function ensureParticipant(room: RoomPayload, peerId: string, nickname?: string) {
@@ -625,6 +701,22 @@ export const handler: Handler = async (event) => {
                 ...room.signals[peerId][body.targetPeerId].ice,
                 ...body.ice,
               ]);
+            }
+          }
+
+          if (body.chatMessage && room.type === 'group') {
+            const existing = room.messages ?? [];
+            if (!existing.some((m) => m.id === body.chatMessage!.id)) {
+              room.messages = [
+                ...existing,
+                {
+                  id: body.chatMessage.id,
+                  senderId: peerId,
+                  senderName: sanitizeNickname(body.chatMessage.senderName) ?? nickname ?? 'Anon',
+                  text: body.chatMessage.text.slice(0, MAX_MESSAGE_TEXT_LENGTH),
+                  createdAt: body.chatMessage.createdAt,
+                },
+              ];
             }
           }
 

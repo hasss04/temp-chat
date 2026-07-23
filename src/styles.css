@@ -1700,14 +1700,24 @@ svg {
   }
 
   .composer textarea {
-    font-size: 15px;
+    font-size: 16px;
     min-height: 28px;
+  }
+
+  /* iOS Safari auto-zooms the whole page when focusing any input/textarea
+     under 16px font-size. That zoom is what made the mobile UI look
+     "cramped/broken" after tapping the password field or the composer —
+     it wasn't just a sizing preference, it was triggering a real browser
+     quirk. Forcing 16px here prevents the zoom entirely. */
+  .setup-field input,
+  .setup-password-row input {
+    font-size: 16px;
   }
 
   .video-call-local {
     width: 80px;
     height: 112px;
-    bottom: 100px;
+    bottom: 130px;
     right: 10px;
   }
 
@@ -1739,6 +1749,38 @@ svg {
 
   .voice-call-header {
     padding-top: 36px;
+  }
+}
+
+@media (max-width: 480px) {
+  .room-header {
+    gap: 6px;
+    padding: 0 8px;
+  }
+
+  .room-avatar {
+    width: 32px;
+    height: 32px;
+    font-size: 12px;
+  }
+
+  .room-header-actions {
+    gap: 0;
+  }
+
+  .icon-action-btn,
+  .icon-danger-btn,
+  .theme-toggle-btn {
+    width: 30px;
+    height: 30px;
+  }
+
+  .room-peer-name {
+    font-size: 13px;
+  }
+
+  .room-subline {
+    font-size: 11px;
   }
 }
 

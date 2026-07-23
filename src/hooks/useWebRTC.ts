@@ -4,6 +4,36 @@ import type { CallQuality, CallType, WireMessage } from '../types';
 
 const CHANNEL_NAME = 'tempchat-v2';
 
+/**
+ * STUN alone only works when both peers are behind simple/full-cone NATs.
+ * Any peer behind a symmetric NAT, CGNAT (very common on mobile carriers),
+ * or a restrictive corporate/public Wi-Fi firewall will fail to connect
+ * without a TURN relay as fallback. Set these env vars (Vite: must be
+ * prefixed VITE_) to point at your TURN provider (Twilio NTS, Metered.ca,
+ * or a self-hosted coturn instance). If they're not set, we fall back to
+ * STUN-only, which is why connections were unreliable before.
+ */
+function buildIceServers(): RTCIceServer[] {
+  const servers: RTCIceServer[] = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
+  ];
+
+  const turnUrls = import.meta.env.VITE_TURN_URLS as string | undefined;
+  const turnUsername = import.meta.env.VITE_TURN_USERNAME as string | undefined;
+  const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL as string | undefined;
+
+  if (turnUrls) {
+    servers.push({
+      urls: turnUrls.split(',').map((u) => u.trim()).filter(Boolean),
+      username: turnUsername,
+      credential: turnCredential,
+    });
+  }
+
+  return servers;
+}
+
 type Handlers = {
   onChat: (msg: Extract<WireMessage, { kind: 'chat' }>) => void;
   onTyping: (isTyping: boolean) => void;
@@ -14,6 +44,14 @@ type Handlers = {
       { kind: 'call-invite' | 'call-accept' | 'call-reject' | 'call-end' | 'call-hold' }
     >,
   ) => void;
+  /**
+   * Called whenever the underlying ICE connection drops to
+   * 'failed' | 'disconnected' | 'closed'. Previously the only reconnect
+   * path was tied to document visibility changes, so a transient network
+   * blip (very common on mobile switching towers/Wi-Fi) while the tab
+   * stayed open/visible had no recovery path at all.
+   */
+  onConnectionTrouble?: (state: RTCIceConnectionState) => void;
 };
 
 export function useWebRTC(handlers: Handlers, restartKey = 0) {
@@ -29,10 +67,7 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
 
   useEffect(() => {
     const pc = new RTCPeerConnection({
-      iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:global.stun.twilio.com:3478' },
-      ],
+      iceServers: buildIceServers(),
       iceCandidatePoolSize: 4,
       iceTransportPolicy: 'all',
     });
@@ -101,6 +136,7 @@ export function useWebRTC(handlers: Handlers, restartKey = 0) {
 
       if (iceState === 'failed' || iceState === 'closed' || iceState === 'disconnected') {
         setStatePartial({ connected: false });
+        handlersRef.current.onConnectionTrouble?.(iceState);
       }
     };
 

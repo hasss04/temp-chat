@@ -4,6 +4,7 @@ import {
   SignalError,
   deriveRole,
   getRoom,
+  joinRoom,
   leaveRoom,
   postAnswer,
   postIce,
@@ -52,6 +53,11 @@ export function SignalBridge() {
   const participants = useAppStore((s) => s.participants);
   const peerId = useAppStore((s) => s.peerId);
 
+  // The presence server already tracks each participant's nickname
+  // (room.participants[].nickname) — we just weren't reading it before.
+  const peerParticipant = participants.find((p) => p.peerId !== peerId);
+  const peerDisplayName = peerParticipant?.nickname?.trim() || 'Anon';
+
   const [role, setRole] = useState<ActiveRole | null>(null);
   const [restartKey, setRestartKey] = useState(0);
   const [peerTyping, setPeerTyping] = useState(false);
@@ -83,6 +89,25 @@ export function SignalBridge() {
   const groupPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const groupInfoRef = useRef(groupInfo);
   groupInfoRef.current = groupInfo;
+
+  const connectionStatusRef = useRef(connectionStatus);
+  connectionStatusRef.current = connectionStatus;
+
+  const triggerReconnect = useCallback(() => {
+    if (!roomId || !secret || !peerId) return;
+    if (connectionStatusRef.current === 'reconnecting' || connectionStatusRef.current === 'joining') return;
+    setStatePartial({ connectionStatus: 'reconnecting', connected: false });
+    pushToast({
+      tone: 'info',
+      title: 'Reconnecting',
+      message: 'Trying to restore the connection.',
+    });
+    answerAppliedRef.current = false;
+    answeredOfferSdpRef.current = null;
+    appliedIce.current = {};
+    pendingIceRef.current = [];
+    setRestartKey((k) => k + 1);
+  }, [roomId, secret, peerId, setStatePartial, pushToast]);
 
   const rtcApi = useWebRTC(
     {
@@ -152,6 +177,14 @@ export function SignalBridge() {
           setOnHold(!!wire.onHold);
         }
       },
+      // Previously, a dropped ICE connection while the tab stayed open and
+      // visible (e.g. a transient mobile network blip switching towers or
+      // Wi-Fi<->cellular) had no recovery path — only visibility/online
+      // events triggered a reconnect. This closes that gap.
+      onConnectionTrouble: () => {
+        if (groupInfoRef.current?.isGroup) return;
+        triggerReconnect();
+      },
     },
     restartKey,
   );
@@ -172,29 +205,28 @@ export function SignalBridge() {
     setHeadphonesOn(false);
   }, []);
 
-  useVisibilityReconnect(
-    () => rtcApiRef.current.getConnectionState(),
-    () => {
-      if (!roomId || !secret || !peerId) return;
-      if (connectionStatus === 'reconnecting' || connectionStatus === 'joining') return;
-      setStatePartial({ connectionStatus: 'reconnecting', connected: false });
-      pushToast({
-        tone: 'info',
-        title: 'Reconnecting',
-        message: 'Trying to restore the connection.',
-      });
-      answerAppliedRef.current = false;
-      answeredOfferSdpRef.current = null;
-      appliedIce.current = {};
-      pendingIceRef.current = [];
-      setRestartKey((k) => k + 1);
-    },
-  );
+  useVisibilityReconnect(() => rtcApiRef.current.getConnectionState(), triggerReconnect);
 
   useEffect(() => {
     if (!roomId || !secret) return;
     persistMessages(roomId, secret, messages).catch(() => {});
   }, [messages, roomId, secret]);
+
+  // Heartbeat: without this, the room's updatedAt/lastSeenAt freeze the
+  // moment the WebRTC connection succeeds (see syncOnce/pollRef below,
+  // which both stop talking to the presence server once connected). That
+  // caused rooms to expire ~30 min after *joining* regardless of ongoing
+  // activity, and participants to be pruned as "stale" after 2 minutes of
+  // silence even mid-conversation. This keeps presence alive for genuinely
+  // active sessions; it stops (and the room can expire) once the tab is
+  // actually closed or the room is left.
+  useEffect(() => {
+    if (!roomId || !secret || !peerId) return;
+    const heartbeat = setInterval(() => {
+      joinRoom(roomId, peerId, nickname, secret).catch(() => {});
+    }, 60_000);
+    return () => clearInterval(heartbeat);
+  }, [roomId, peerId, nickname, secret]);
 
   useEffect(() => {
     if (!roomId || !secret) return;
@@ -752,11 +784,11 @@ export function SignalBridge() {
       <header className="room-header">
         <div className="room-header-main">
           <div className="room-avatar">
-            {groupInfo?.isGroup ? <Users size={16} /> : initialsOf('Peer')}
+            {groupInfo?.isGroup ? <Users size={16} /> : initialsOf(peerDisplayName)}
           </div>
           <div className="room-meta">
             <div className="room-meta-top">
-              <p className="room-peer-name">{groupInfo?.isGroup ? 'Group room' : 'Private room'}</p>
+              <p className="room-peer-name">{groupInfo?.isGroup ? 'Group room' : peerDisplayName}</p>
               <span
                 className={`status-pill ${
                   connectionStatus === 'connected'
@@ -840,13 +872,14 @@ export function SignalBridge() {
             draft={draft}
             onDraftChange={handleDraftChange}
             onSend={sendMessage}
+            peerName={groupInfo?.isGroup ? undefined : peerDisplayName}
           />
         </main>
       </div>
 
       {!groupInfo?.isGroup && callActive && callType === 'voice' && (
         <VoiceCallView
-          peerName="Peer"
+          peerName={peerDisplayName}
           phase={callPhase}
           quality={callQuality}
           micOn={micOn}
@@ -866,7 +899,7 @@ export function SignalBridge() {
 
       {!groupInfo?.isGroup && callActive && callType === 'video' && (
         <VideoCallView
-          peerName="Peer"
+          peerName={peerDisplayName}
           phase={callPhase}
           quality={callQuality}
           micOn={micOn}

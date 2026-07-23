@@ -11,13 +11,15 @@
   "workspace": {
     "packageJson": {
       "dependencies": [
-        "npm:@netlify/blobs@^8.2.0",
-        "npm:@netlify/functions@^3.1.8",
+        "npm:@netlify/blobs@^9.1.2",
+        "npm:@netlify/functions@^3.1.10",
+        "npm:@types/node@^26.1.1",
         "npm:@types/react-dom@^18.3.0",
         "npm:@types/react@^18.3.3",
         "npm:@vitejs/plugin-react@^4.3.1",
         "npm:idb@8",
         "npm:lucide-react@0.525",
+        "npm:netlify-cli@^26.2.0",
         "npm:react-dom@^18.3.1",
         "npm:react@^18.3.1",
         "npm:typescript@^5.5.4",

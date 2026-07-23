@@ -44,6 +44,7 @@ const MessageBubble = memo(function MessageBubble({
   endsGroup,
   showAvatar,
   connected,
+  peerName,
 }: {
   message: PlainMessage;
   isMe: boolean;
@@ -51,6 +52,7 @@ const MessageBubble = memo(function MessageBubble({
   endsGroup: boolean;
   showAvatar: boolean;
   connected: boolean;
+  peerName: string;
 }) {
   return (
     <div className={`msg-row ${isMe ? 'me' : 'peer'} msg-enter`}>
@@ -59,7 +61,7 @@ const MessageBubble = memo(function MessageBubble({
           className={`msg-avatar ${showAvatar ? '' : 'ghost'}`}
           aria-hidden={!showAvatar}
         >
-          {showAvatar ? initialsOf('Peer') : ''}
+          {showAvatar ? initialsOf(peerName) : ''}
         </span>
       )}
       <div className={`msg-stack ${isMe ? 'me' : 'peer'}`}>
@@ -107,10 +109,10 @@ const MessageBubble = memo(function MessageBubble({
   );
 });
 
-const TypingIndicator = memo(function TypingIndicator() {
+const TypingIndicator = memo(function TypingIndicator({ peerName }: { peerName: string }) {
   return (
     <div className="msg-row peer msg-enter">
-      <span className="msg-avatar">{initialsOf('Peer')}</span>
+      <span className="msg-avatar">{initialsOf(peerName)}</span>
       <div className="msg-stack peer">
         <div className="typing-bubble" aria-label="Peer is typing">
           <span />
@@ -129,9 +131,19 @@ type Props = {
   draft: string;
   onDraftChange: (value: string) => void;
   onSend: () => void;
+  /** Real display name of the other participant (private rooms only). */
+  peerName?: string;
 };
 
-export function ChatView({ messages, connected, peerTyping, draft, onDraftChange, onSend }: Props) {
+export function ChatView({
+  messages,
+  connected,
+  peerTyping,
+  draft,
+  onDraftChange,
+  onSend,
+  peerName = 'Peer',
+}: Props) {
   const logRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -266,11 +278,12 @@ export function ChatView({ messages, connected, peerTyping, draft, onDraftChange
                 endsGroup={endsGroup}
                 showAvatar={!!startsGroup && !isMe}
                 connected={connected}
+                peerName={peerName}
               />
             </div>
           );
         })}
-        {peerTyping && <TypingIndicator />}
+        {peerTyping && <TypingIndicator peerName={peerName} />}
         <div ref={bottomRef} />
       </div>
 
