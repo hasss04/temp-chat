@@ -45,6 +45,8 @@ type RoomPayload = {
   signals: Record<string, Record<string, PeerSignalState>>;
   passwordHash?: string;
   messages: ChatMessage[];
+  /** Monotonic write counter used to detect concurrent writes (see loadMutateSave). */
+  version: number;
 };
 
 type PresenceErrorCode =
@@ -225,6 +227,7 @@ function emptyRoom(type: RoomType = 'private', maxPeers?: number): RoomPayload {
     signals: {},
     passwordHash: undefined,
     messages: [],
+    version: 0,
   };
 }
 
@@ -389,6 +392,7 @@ function sanitizeRoom(room: RoomPayload): RoomPayload {
     signals,
     passwordHash: sanitizePasswordHash(room.passwordHash),
     messages: type === 'group' ? sanitizeChatMessages(room.messages) : [],
+    version: typeof room.version === 'number' ? room.version : 0,
   };
 }
 
@@ -513,8 +517,6 @@ async function loadMutateSave(
   roomId: string,
   mutate: (room: RoomPayload) => RoomPayload | Promise<RoomPayload>,
 ): Promise<RoomPayload> {
-  let lastSeenUpdatedAt = -1;
-
   for (let attempt = 0; attempt < WRITE_RETRY_ATTEMPTS; attempt += 1) {
     const existing = await withRetry('loadRoom', WRITE_RETRY_ATTEMPTS, () =>
       getRoomFresh(store, roomId),
@@ -525,22 +527,41 @@ async function loadMutateSave(
       await store.delete(roomId).catch(() => {});
     }
 
-    const beforeMutateUpdatedAt = currentRoom.updatedAt;
+    const versionBeforeMutate = currentRoom.version;
+
     const mutated = await mutate(currentRoom);
     mutated.updatedAt = Date.now();
+    mutated.version = versionBeforeMutate + 1;
     const finalRoom = sanitizeRoom(mutated);
+    finalRoom.version = mutated.version;
 
-    if (attempt === 0 || beforeMutateUpdatedAt === lastSeenUpdatedAt) {
-      lastSeenUpdatedAt = beforeMutateUpdatedAt;
-      try {
-        await saveRoom(store, roomId, finalRoom);
-        return finalRoom;
-      } catch (error) {
-        if (attempt === WRITE_RETRY_ATTEMPTS - 1) throw error;
-        await sleep(WRITE_RETRY_BASE_DELAY_MS * (attempt + 1));
+    try {
+      // Requests like postOffer/postIce/postAnswer commonly land within
+      // milliseconds of each other (ICE gathering starts immediately once
+      // a local offer is set). Without this check, a read-modify-write
+      // race would silently drop whichever write lost the race — e.g. an
+      // ICE candidate saved right after an offer would overwrite the room
+      // with a stale copy that never had the offer at all. Re-reading the
+      // version right before saving and bailing out (to retry against the
+      // latest state) closes that window.
+      const recheck = await withRetry('recheckRoom', WRITE_RETRY_ATTEMPTS, () =>
+        getRoomFresh(store, roomId),
+      );
+      const recheckVersion = isFreshRoom(recheck) ? sanitizeRoom(recheck).version : 0;
+
+      if (recheckVersion !== versionBeforeMutate) {
+        // Someone else wrote in between our read and our write — don't
+        // clobber it. Back off briefly and retry the whole cycle against
+        // the now-current state.
+        await sleep(WRITE_RETRY_BASE_DELAY_MS * (attempt + 1) + Math.floor(Math.random() * 40));
+        continue;
       }
-    } else {
-      lastSeenUpdatedAt = beforeMutateUpdatedAt;
+
+      await saveRoom(store, roomId, finalRoom);
+      return finalRoom;
+    } catch (error) {
+      if (attempt === WRITE_RETRY_ATTEMPTS - 1) throw error;
+      await sleep(WRITE_RETRY_BASE_DELAY_MS * (attempt + 1));
     }
   }
 
